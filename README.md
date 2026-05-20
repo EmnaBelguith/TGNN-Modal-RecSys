@@ -97,26 +97,4 @@ modal_loss = InfoNCE(h_v[batch], h_t[batch])    # alignement img/txt
 
 ---
 
-## Installation et lancement (cluster Télécom Paris)
 
-```bash
-git clone https://github.com/EmnaBelguith/TGNN-Modal-RecSys.git
-cd TGNN-Modal-RecSys
-```
-
-**Changer ligne 4 dans `model/model_run.py` :**
-```python
-# Remplace par le chemin où tu as cloné le repo
-sys.path.append("/home/infres/TON_USERNAME/TGNN-Modal-RecSys")
-```
-
-**Données disponibles sur le cluster (permissions ouvertes) :**
-- Dataset : `/home/infres/belguith/PFE/processed/Musical_reviews_with_aspects.jsonl`
-- Features : `/home/infres/belguith/PFE/bm3_data/musical/`
-- BERT embeddings : `/home/infres/belguith/PFE/HADSF_test/checkpoint/Musical_HADSF/`
-
-**Lancer :**
-```bash
-cd model/
-python model_run.py --seed 42
-```
