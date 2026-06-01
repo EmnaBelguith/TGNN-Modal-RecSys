@@ -80,21 +80,6 @@ loss = r_loss + 0.1 * modal_loss
 r_loss     = CrossEntropy(predicts, ratings)    # classification ratings 1-5
 modal_loss = InfoNCE(h_v[batch], h_t[batch])    # alignement img/txt
 
----
 
-## Résultats sur Musical (Amazon)
-
-| Config | RMSE | MAE | MSE |
-|---|---|---|---|
-| Baseline (sans modal) | 1.0284 | 0.7142 | 1.0575 |
-| alpha=1 (init seule, sans fusion) | 1.0270 | 0.7182 | 1.0548 |
-| **Notre modèle (init + fusion)** | **1.0246** | 0.7261 | **1.0498** |
-
-**Ablation :**
-- Init depuis h_modal seule : -0.0014 RMSE
-- Fusion modale (gate) : -0.0024 RMSE supplémentaire
-- Total : -0.0038 RMSE vs baseline
-
----
 
 
