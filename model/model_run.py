@@ -43,9 +43,11 @@ def config():
     parser.add_argument('--gcn_dropout', type=float, default=0.7)
     parser.add_argument('--num_layers', type=int, default=1)
     parser.add_argument('--ed_alpha', type=float, default=.1)
+    parser.add_argument('--model_short_name', type=str, default='RHGC4')
+    parser.add_argument('--w_deg_init', type=float, default=2.0)
+    parser.add_argument('--b_deg_init', type=float, default=-5.0)
 
     args = parser.parse_args()
-    args.model_short_name = 'RHGC4'
 
     # args.dataset_name = 'Digital_Music_5'
     # args.dataset_path = '/home/d1/shuaijie/data/Digital_Music_5/Digital_Music_5.json'
@@ -221,8 +223,8 @@ class MultiLayerHeteroGraphConv(nn.Module):
         nn.init.xavier_uniform_(self.item_embedding.unsqueeze(0)).squeeze(0)
         self.h_modal = None  # sera injecté depuis ModalEncoder
         self.item_degree_tensor = None  # sera injecté depuis l'extérieur
-        self.w_deg = 2.0   # fixe — positif : degré élevé → alpha élevé → collab domine
-        self.b_deg = -5.0  # fixe — cold(deg=7)→alpha≈0.30, warm(deg=30)→alpha≈0.86
+        self.w_deg = nn.Parameter(torch.tensor(2.0))
+        self.b_deg = nn.Parameter(torch.tensor(-5.0))
         self.gate_residual = nn.Sequential(
             nn.Linear(msg_units * 2, 32),
             nn.ReLU(),
@@ -278,7 +280,7 @@ class MultiLayerHeteroGraphConv(nn.Module):
                     item_collab = self.item_embedding[input_nodes['item']]
                     item_modal  = self.h_modal[input_nodes['item']]
                     degrees = self.item_degree_tensor[input_nodes['item']]
-                    alpha_deg = torch.sigmoid(2.0 * torch.log1p(degrees) - 5.0).unsqueeze(-1)
+                    alpha_deg = torch.sigmoid(torch.abs(self.w_deg) * torch.log1p(degrees) + self.b_deg).unsqueeze(-1)
                     gate_input = torch.cat([item_collab, item_modal], dim=-1)
                     residual = self.gate_residual(gate_input) * 0.2
                     alpha = torch.clamp(alpha_deg + residual, 0.0, 1.0)
@@ -967,6 +969,9 @@ def train(params):
 
     net = Net(dataset.review_embedding, dataset.sentence_embedding, params)
     net = net.to(params.device)
+    with torch.no_grad():
+        net.rating_encoder.w_deg.fill_(params.w_deg_init)
+        net.rating_encoder.b_deg.fill_(params.b_deg_init)
    # === MODAL ENCODER ===
     v_feat, t_feat = load_modal_features('/home/infres/belguith/PFE/bm3_data/musical')
     modal_enc = ModalEncoder(v_feat, t_feat, embed_dim=params.gcn_out_units).to(params.device)
@@ -1144,7 +1149,7 @@ def train(params):
             print(f"[DIAG] cosine sim h_modal/collab = {_sim:.4f}", flush=True)
             # GATE monitor
             _degrees_all = net.rating_encoder.item_degree_tensor[:_n]
-            _alpha = torch.sigmoid(net.rating_encoder.w_deg * torch.log1p(_degrees_all) + net.rating_encoder.b_deg).unsqueeze(-1)
+            _alpha = torch.sigmoid(torch.abs(net.rating_encoder.w_deg) * torch.log1p(_degrees_all) + net.rating_encoder.b_deg).unsqueeze(-1)
             _std_items = _alpha.std(dim=0).mean()
             _std_dims  = _alpha.std(dim=1).mean()
             print(f"[GATE] epoch={iter_idx} mean={_alpha.mean():.3f} std_global={_alpha.std():.3f} std_inter_items={_std_items:.3f} std_inter_dims={_std_dims:.3f} min={_alpha.min():.3f} max={_alpha.max():.3f}", flush=True)
