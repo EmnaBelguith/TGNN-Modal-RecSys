@@ -29,7 +29,7 @@ def config():
     parser.add_argument('--review_feat_size', type=int, default=128)
 
     parser.add_argument('--epoch', type=int, default=200)
-    parser.add_argument('--batch_size', type=float, default=10000)
+    parser.add_argument('--batch_size', type=int, default=None)
     parser.add_argument('--train_grad_clip', type=float, default=1.0)
     parser.add_argument('--train_lr', type=float, default=0.001)
     parser.add_argument('--train_min_lr', type=float, default=0.0001)
@@ -40,12 +40,19 @@ def config():
 
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--lambda_f', type=float, default=1e-4)
-    parser.add_argument('--gcn_dropout', type=float, default=0.7)
+    parser.add_argument('--lambda_l2', type=float, default=None)
+    parser.add_argument('--gcn_dropout', type=float, default=None)
     parser.add_argument('--num_layers', type=int, default=1)
     parser.add_argument('--ed_alpha', type=float, default=.1)
     parser.add_argument('--model_short_name', type=str, default='RHGC4')
     parser.add_argument('--w_deg_init', type=float, default=2.0)
     parser.add_argument('--b_deg_init', type=float, default=-5.0)
+    parser.add_argument('--lambda_mi', type=float, default=0.0)
+    parser.add_argument('--neg_strategy', type=str, default='random',
+                        choices=['random', 'multi_random', 'inbatch'])
+    parser.add_argument('--n_neg', type=int, default=5)
+    parser.add_argument('--lambda_mi_warmup', type=int, default=0)
+    parser.add_argument('--no_modal', action='store_true', default=False)
 
     args = parser.parse_args()
 
@@ -55,7 +62,7 @@ def config():
     # args.gcn_dropout = 0.7
     args.device = 0
     # args.num_layers = 2
-    args.batch_size = 512
+    if args.batch_size is None: args.batch_size = 512
 
     # args.dataset_name = 'Toys_and_Games_5'
     # args.dataset_path = '/home/d1/shuaijie/data/Toys_and_Games_5/Toys_and_Games_5.json'
@@ -64,7 +71,7 @@ def config():
     # args.ed_alpha = 0.1
     # args.device = 0
     # args.num_layers = 2
-    args.batch_size = 512
+    if args.batch_size is None: args.batch_size = 512
     # args.epoch = 2000
 
     # args.dataset_name = 'Sports_and_Outdoors_5'
@@ -84,11 +91,12 @@ def config():
   # Nouveaux chemins (à ajouter)
     args.dataset_name = 'Musical_HADSF'
     args.dataset_path = '/home/infres/belguith/PFE/processed/Musical_reviews_with_aspects.jsonl'
-    args.gcn_dropout = 0.8
+    if args.gcn_dropout is None: args.gcn_dropout = 0.8
+    if args.lambda_l2 is None: args.lambda_l2 = 0.0
     args.ed_alpha = 2.0
     args.device = 0
     args.num_layers = 2
-    args.batch_size = 512
+    if args.batch_size is None: args.batch_size = 512
 
     #     # args.dataset_name = 'Health_and_Personal_Care_5'
     #     # args.dataset_path = '/home/d1/shuaijie/data/Health_and_Personal_Care_5/Health_and_Personal_Care_5.json'
@@ -102,7 +110,7 @@ def config():
     args.device = 0
     args.dataset_name = 'Musical_HADSF'
     args.dataset_path = '/home/infres/belguith/PFE/processed/Musical_reviews_with_aspects.jsonl'
-    args.gcn_dropout = 0.8
+    if args.gcn_dropout is None: args.gcn_dropout = 0.8
     args.ed_alpha = 2.0
     # args.epoch = 800
     # args.num_layers = 2
@@ -117,7 +125,15 @@ def config():
     args.model_short_name = 'RHGC4_ranking'
 
     # configure save_fir to save all the info
-    args.model_save_path = f'model_save/{args.dataset_name}/{args.model_short_name}_layers_{args.num_layers}.pt'
+    _l2_tag  = f'_l2{args.lambda_l2}' if args.lambda_l2 > 0 else ''
+    _bs_tag  = f'_bs{args.batch_size}'
+    _mi_tag  = f'_mi{args.lambda_mi}' if args.lambda_mi > 0 else ''
+    _dp_tag  = f'_dp{args.gcn_dropout}' if args.gcn_dropout != 0.8 else ''
+    _neg_tag  = f'_{args.neg_strategy}' if args.neg_strategy != 'random' else ''
+    _nneg_tag = f'_k{args.n_neg}' if args.neg_strategy == 'multi_random' else ''
+    _warm_tag  = f'_warm{args.lambda_mi_warmup}' if args.lambda_mi_warmup > 0 else ''
+    _nmod_tag  = '_nomodal' if args.no_modal else ''
+    args.model_save_path = f'model_save/{args.dataset_name}/{args.model_short_name}_layers_{args.num_layers}_seed{args.seed}{_l2_tag}{_bs_tag}{_mi_tag}{_dp_tag}{_neg_tag}{_nneg_tag}{_warm_tag}{_nmod_tag}.pt'
     if not os.path.isdir(f'model_save/{args.dataset_name}'):
         os.makedirs(f'model_save/{args.dataset_name}')
 
@@ -519,21 +535,20 @@ class SentenceRetrival(nn.Module):
 
     def calc_sentence_ranking(self, edges):
         rh = self.rating_linear(torch.cat([edges.src['rf'], edges.dst['rf']], dim=1))
-
         th = self.topic_linear(torch.cat([edges.src['tf'], edges.dst['tf']], dim=1))
         th = th + rh
         pos_sid = edges.data['sentence_id']
-        neg_sid = torch.randint(1, self.sentence_embedding.weight.shape[0],
-                                pos_sid.shape,
-                                device=pos_sid.device)
-
         pos_review = self.get_review_feature(pos_sid)
-        neg_review = self.get_review_feature(neg_sid)
-
         pos_score = (th * pos_review).sum(1)
-        neg_score = (th * neg_review).sum(1)
-        loss = -(pos_score - neg_score).sigmoid().log()
-
+        n_neg = getattr(self, '_n_neg', 1)
+        losses = []
+        for _ in range(n_neg):
+            neg_sid = torch.randint(1, self.sentence_embedding.weight.shape[0],
+                                    pos_sid.shape, device=pos_sid.device)
+            neg_review = self.get_review_feature(neg_sid)
+            neg_score = (th * neg_review).sum(1)
+            losses.append(-(pos_score - neg_score).sigmoid().log())
+        loss = torch.stack(losses, dim=0).mean(0)
         return {'mi_score': loss, 'ranking_loss': loss}
 
     def predict_score(self, graph, urf, irf):
@@ -548,16 +563,38 @@ class SentenceRetrival(nn.Module):
             graph.apply_edges(_score_func)
             return graph.edata['s'].squeeze(-1)
         
-    def forward(self, graph, urf, irf, utf, itf):
+    def forward(self, graph, urf, irf, utf, itf, neg_strategy='random', n_neg=1):
         graph.nodes['user'].data['rf'] = urf
         graph.nodes['item'].data['rf'] = irf
         graph.nodes['user'].data['tf'] = utf
         graph.nodes['item'].data['tf'] = itf
 
         with graph.local_scope():
-            graph.apply_edges(self.calc_sentence_ranking)
-            mi_score = graph.edata['mi_score']
-            ranking_loss = graph.edata['ranking_loss']
+            if neg_strategy == 'inbatch':
+                def _store(edges):
+                    rh = self.rating_linear(torch.cat([edges.src['rf'], edges.dst['rf']], dim=1))
+                    th_val = self.topic_linear(torch.cat([edges.src['tf'], edges.dst['tf']], dim=1))
+                    return {'_th': th_val + rh, '_pids': edges.data['sentence_id']}
+                graph.apply_edges(_store)
+                th = graph.edata['_th']
+                pos_sid = graph.edata['_pids']
+                pos_review = self.get_review_feature(pos_sid)
+                pos_score = (th * pos_review).sum(1)
+                N = th.shape[0]
+                score_mat = th @ pos_review.T
+                diag = torch.eye(N, dtype=torch.bool, device=th.device)
+                score_mat = score_mat.masked_fill(diag, float('-inf'))
+                pos_exp = pos_score.unsqueeze(1).expand(N, N)
+                bpr = -(pos_exp - score_mat).sigmoid().log()
+                bpr = bpr.masked_fill(diag, 0.0)
+                loss = bpr.sum(1) / (N - 1)
+                mi = loss.mean()
+                return mi, mi
+            else:
+                self._n_neg = n_neg if neg_strategy == 'multi_random' else 1
+                graph.apply_edges(self.calc_sentence_ranking)
+                mi_score = graph.edata['mi_score']
+                ranking_loss = graph.edata['ranking_loss']
         return mi_score.mean(), ranking_loss.mean()
 
     def measure_sim(self, interaction_feat, sid_list):
@@ -682,6 +719,9 @@ class Net(nn.Module):
 
         self.sentence_embedding = sentence_embedding# nn.Embedding.from_pretrained(sentence_embedding)
         self.review_embedding = nn.Embedding.from_pretrained(review_embedding)
+        self.lambda_l2 = params.lambda_l2
+        self.neg_strategy = params.neg_strategy
+        self.n_neg = params.n_neg
         self.rating_encoder = MultiLayerHeteroGraphConv(params.rating_values, \
                                                         self.review_embedding, \
                                                         params.user_size, \
@@ -725,7 +765,9 @@ class Net(nn.Module):
         # Sentence ranking loss (topic-based, unchanged)
         ed_mi, ranking_loss = self.topic_decoder(pos_graph,
                                                  urf, irf,
-                                                 utf + urf, itf + irf)
+                                                 utf + urf, itf + irf,
+                                                 neg_strategy=self.neg_strategy,
+                                                 n_neg=self.n_neg)
 
         # BPR avec in-batch negatives :
         # pour chaque paire (u_i, pos_i), le négatif est pos_{perm(i)} (item d'une autre paire du batch)
@@ -751,6 +793,11 @@ class Net(nn.Module):
             weight = weight * sample_weight
             weight = weight / (weight.mean() + 1e-9)
         bpr_loss = -(weight * F.logsigmoid(score_pos - score_neg)).mean()
+        l2_reg = self.lambda_l2 * (
+            self.rating_encoder.user_embedding.norm(2).pow(2) +
+            self.rating_encoder.item_embedding.norm(2).pow(2)
+        ) / u_emb.shape[0]
+        bpr_loss = bpr_loss + l2_reg
 
         # BPR diagnostic — premiers batches + tous les 100 steps
         self._bpr_step = getattr(self, '_bpr_step', 0) + 1
@@ -952,6 +999,9 @@ def train(params):
     np.random.seed(params.seed)
     torch.manual_seed(params.seed)
     torch.cuda.manual_seed_all(params.seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.use_deterministic_algorithms(True, warn_only=True)
     print(f"[SEED] {params.seed}", flush=True)
 
     # global logger
@@ -1090,7 +1140,12 @@ def train(params):
             rating_blocks      = [b.to(params.device) for b in rating_blocks]
             topic_blocks       = [b.to(params.device) for b in topic_blocks]
 
-            h_modal, h_v, h_t = modal_enc()
+            if params.no_modal:
+                h_modal = torch.zeros(net.rating_encoder.item_embedding.weight.shape[0],
+                                      params.gcn_out_units, device=params.device)
+                h_v = h_t = h_modal
+            else:
+                h_modal, h_v, h_t = modal_enc()
             net.rating_encoder.h_modal = h_modal
 
             # Poids cold-start : upweight les interactions des items peu vus
@@ -1109,7 +1164,8 @@ def train(params):
             )
 
             batch_items = pos_graph_train.nodes['item'].data['_ID']
-            modal_loss  = modal_enc.calculate_loss_infonce(h_v, h_t, batch_items)
+            modal_loss  = torch.tensor(0.0, device=params.device) if params.no_modal else \
+                          modal_enc.calculate_loss_infonce(h_v, h_t, batch_items)
 
             # Fusion Loss — BPR sur embeddings modaux (rating >= 3 pos, <= 2 neg)
             _src_idx_f, _dst_idx_f = pos_graph_train.edges()
@@ -1120,7 +1176,7 @@ def train(params):
             _mask_pos = _ratings_batch >= 3
             _mask_neg = _ratings_batch <= 2
             f_loss = torch.tensor(0.0, device=params.device)
-            if _mask_pos.sum() > 0 and _mask_neg.sum() > 0:
+            if not params.no_modal and _mask_pos.sum() > 0 and _mask_neg.sum() > 0:
                 _n_f = min(_mask_pos.sum().item(), _mask_neg.sum().item())
                 f_loss = net.compute_fusion_loss(
                     _u_emb_per_edge[_mask_pos][:_n_f],
@@ -1129,14 +1185,15 @@ def train(params):
                     lambda_f=params.lambda_f
                 )
 
-            loss = r_loss + 0.1 * modal_loss + f_loss
+            _eff_lambda_mi = params.lambda_mi if iter_idx > params.lambda_mi_warmup else 0.0
+            mi_term = _eff_lambda_mi * mi_score if _eff_lambda_mi > 0 else torch.tensor(0.0, device=params.device)
+            loss = r_loss + 0.1 * modal_loss + f_loss + mi_term
             optimizer.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(net.parameters(), params.train_grad_clip)
             optimizer.step()
 
-            # print(f"ranking:{ranking_loss.item():.4f}")
-            pbar.set_description(f"train_loss={r_loss:.4f}, MI={mi_score:.2f}, ranking={ranking_loss.item():.4f}, modal={modal_loss.item():.4f}, f_loss={f_loss.item():.6f}")
+            pbar.set_description(f"train_loss={r_loss:.4f}, MI={mi_score:.2f}, mi_term={mi_term.item():.4f}, modal={modal_loss.item():.4f}, f_loss={f_loss.item():.6f}")
             
             # with torch.no_grad():
             #     predict_ratings = net.predicts_to_ratings(predicts)
@@ -1158,6 +1215,8 @@ def train(params):
             # DIAG variance + normes + comparaison
             _collab_norm = _e.norm(dim=-1).mean()
             _modal_norm  = _h.norm(dim=-1).mean()
+            _user_emb_norm = net.rating_encoder.user_embedding.norm(dim=-1).mean().item()
+            print(f"[EMB_NORM] epoch={iter_idx:>3d}  user={_user_emb_norm:.4f}  item={_collab_norm.item():.4f}", flush=True)
             print(f"[DIAG] h_modal std_per_dim={_h.std(dim=0).mean():.4f} std_per_item={_h.std(dim=1).mean():.4f} norm={_modal_norm:.3f} | collab norm={_collab_norm:.3f}", flush=True)
             # DIAG cosine similarity
             _sim = torch.nn.functional.cosine_similarity(_h[:_n], _e).mean()
@@ -1237,6 +1296,24 @@ def train(params):
             _ratio    = _urf_norm / (_irf_norm + 1e-9)
             repr_norm_history.append((iter_idx, _urf_norm, _irf_norm, _ratio))
             print(f"[REPR_NORM] epoch={iter_idx:>3d}  user={_urf_norm:.4f}  item={_irf_norm:.4f}  ratio_u/i={_ratio:.4f}", flush=True)
+
+            # --- Monitoring TopicGraphEncoder : vérifie si les poids changent ---
+            if params.lambda_mi > 0:
+                with torch.no_grad():
+                    _topic_w_norm = sum(p.norm().item() for p in net.topic_encoder.parameters())
+                    _topic_g_norm = sum(
+                        p.grad.norm().item() for p in net.topic_encoder.parameters()
+                        if p.grad is not None
+                    )
+                    print(
+                        f"[TOPIC_ENCODER] epoch={iter_idx:>3d}"
+                        f"  param_norm={_topic_w_norm:.4f}"
+                        f"  grad_norm={_topic_g_norm:.4f}"
+                        f"  ed_mi={mi_score:.4f}"
+                        f"  eff_lambda={_eff_lambda_mi}"
+                        f"  (warmup={params.lambda_mi_warmup})",
+                        flush=True
+                    )
 
         valid_ndcg  = net.evaluate_ranking_ndcg(valid_dataloader, dataset, K=10, etype='valid')
         logging_str = (f"Epoch={iter_idx:>3d}, "
