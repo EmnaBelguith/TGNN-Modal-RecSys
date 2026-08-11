@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-# Évaluation baseline ranking — Rating RMSE + Item Ranking cold/medium/warm
-# Usage : python eval_baseline_ranking.py [--ckpt <path>]
+# Sanity check — modèle à poids aléatoires (aucun checkpoint chargé)
+# Attendu : nDCG@10 ≈ 0.045 (théorie pour 1 pos + 99 neg random)
 
 import sys
 import math
@@ -17,10 +17,10 @@ from rhg_data import GraphData
 
 
 def evaluate_item_ranking(net, test_dataloader, dataset, ks=(5, 10, 20),
-                           relevance_threshold=1, n_neg=99):
+                           relevance_threshold=3, n_neg=99, seed=42):
     device = net.review_embedding.weight.device
     net.eval()
-    rng = np.random.default_rng(42)
+    rng = np.random.default_rng(seed)
 
     graph = dataset.graph
     train_u, train_i = graph['train'].edges()
@@ -139,13 +139,10 @@ def evaluate_item_ranking(net, test_dataloader, dataset, ks=(5, 10, 20),
 
 def main():
     _pre = argparse.ArgumentParser(add_help=False)
-    _pre.add_argument('--ckpt', type=str, default=None)
     _args, _remaining = _pre.parse_known_args()
     sys.argv = [sys.argv[0]] + _remaining
 
     params = config()
-    if _args.ckpt:
-        params.model_save_path = _args.ckpt
 
     dataset = GraphData(params.dataset_name, params.dataset_path)
     params.user_size         = dataset.user_size
@@ -156,16 +153,16 @@ def main():
     _, _, test_dataloader = dataset.get_dataloaders(
         batch_size=params.batch_size, num_layers=params.num_layers)
 
+    # Sanity : poids Xavier aléatoires, aucun checkpoint chargé
     net = Net(dataset.review_embedding, dataset.sentence_embedding, params)
-    net.load_state_dict(torch.load(params.model_save_path, weights_only=False), strict=False)
     net = net.to(params.device)
 
     print(f'\n{"="*60}')
     print(f'  Dataset    : {params.dataset_name}')
-    print(f'  Checkpoint : {params.model_save_path}')
+    print(f'  Checkpoint : RANDOM INIT (sanity check — attendu nDCG@10 ≈ 0.045)')
     print(f'{"="*60}')
 
-    print('\n── [1] ITEM RANKING  (1 pos + 99 neg, rating≥1 = pertinent) ──')
+    print('\n── [1] ITEM RANKING  (1 pos + 99 neg, rating≥3 = pertinent) ──')
     print(f'  {"K":>4}  {"nDCG@K":>8}  {"Recall@K":>9}  {"HR@K":>7}  {"Prec@K":>8}')
     item_rank_scores, grp_rank_scores = evaluate_item_ranking(
         net, test_dataloader, dataset, ks=(5, 10, 20))

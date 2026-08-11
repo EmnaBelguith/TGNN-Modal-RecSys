@@ -10,7 +10,7 @@ import os
 from dgl.data.utils import save_graphs, load_graphs
 from tqdm import tqdm
 from collections import defaultdict
-from load_data import load_aspect_data
+from load_data_temporal import load_aspect_data_temporal as load_aspect_data
 import torch.nn as nn
 
 

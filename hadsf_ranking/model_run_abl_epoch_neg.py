@@ -2,7 +2,7 @@
 
 import sys
 sys.path.append("/home/infres/belguith/PFE")
-from modal_encoder import ModalEncoder, load_modal_features
+from modal_encoder_abl import ModalEncoder, load_modal_features
 import torch.nn.functional as F
 
 import argparse
@@ -27,8 +27,6 @@ def config():
     parser.add_argument('-dp', '--dataset_path', type=str, help='raw dataset file path')
     parser.add_argument('--model_save_path', type=str, help='The model saving path')
     parser.add_argument('--run_tag', type=str, default='', help='Suffix appended to checkpoint filename (e.g. _v2)')
-    parser.add_argument('--test_only', action='store_true', default=False,
-                        help='Skip training, load existing checkpoint and run test() directly')
     parser.add_argument('--review_feat_size', type=int, default=128)
 
     parser.add_argument('--epoch', type=int, default=200)
@@ -36,6 +34,7 @@ def config():
     parser.add_argument('--train_grad_clip', type=float, default=1.0)
     parser.add_argument('--train_lr', type=float, default=0.001)
     parser.add_argument('--train_min_lr', type=float, default=0.0001)
+    parser.add_argument('--cosine_lr',    action='store_true', default=False)
     parser.add_argument('--train_lr_decay_factor', type=float, default=0.5)
     parser.add_argument('--train_decay_patience', type=int, default=8)
     parser.add_argument('--train_early_stopping_patience', type=int, default=10)
@@ -50,12 +49,15 @@ def config():
     parser.add_argument('--model_short_name', type=str, default='RHGC4')
     parser.add_argument('--w_deg_init', type=float, default=2.0)
     parser.add_argument('--b_deg_init', type=float, default=-5.0)
-    parser.add_argument('--lambda_mi', type=float, default=0.01)
-    parser.add_argument('--neg_strategy', type=str, default='inbatch',
+    parser.add_argument('--lambda_mi', type=float, default=0.0)
+    parser.add_argument('--neg_strategy', type=str, default='random',
                         choices=['random', 'multi_random', 'inbatch'])
     parser.add_argument('--n_neg', type=int, default=5)
-    parser.add_argument('--lambda_mi_warmup', type=int, default=20)
+    parser.add_argument('--lambda_mi_warmup', type=int, default=0)
     parser.add_argument('--no_modal', action='store_true', default=False)
+    parser.add_argument('--no_image', action='store_true', default=False)
+    parser.add_argument('--no_text',  action='store_true', default=False)
+    parser.add_argument('--force_alpha_one', action='store_true', default=False)
 
     args = parser.parse_args()
 
@@ -95,7 +97,7 @@ def config():
     args.dataset_name = 'Musical_HADSF'
     args.dataset_path = '/home/infres/belguith/PFE/processed/Musical_reviews_with_aspects.jsonl'
     if args.gcn_dropout is None: args.gcn_dropout = 0.8
-    if args.lambda_l2 is None: args.lambda_l2 = 1e-4
+    if args.lambda_l2 is None: args.lambda_l2 = 0.0
     args.ed_alpha = 2.0
     args.device = 0
     args.num_layers = 2
@@ -113,7 +115,7 @@ def config():
     args.device = 0
     args.dataset_name = 'Musical_HADSF'
     args.dataset_path = '/home/infres/belguith/PFE/processed/Musical_reviews_with_aspects.jsonl'
-    if args.gcn_dropout is None: args.gcn_dropout = 0.8
+    args.gcn_dropout = 0.8
     args.ed_alpha = 2.0
     # args.epoch = 800
     # args.num_layers = 2
@@ -133,11 +135,14 @@ def config():
     _mi_tag  = f'_mi{args.lambda_mi}' if args.lambda_mi > 0 else ''
     _dp_tag  = f'_dp{args.gcn_dropout}' if args.gcn_dropout != 0.8 else ''
     _neg_tag  = f'_{args.neg_strategy}' if args.neg_strategy != 'random' else ''
-    _nneg_tag = f'_k{args.n_neg}' if args.neg_strategy == 'multi_random' else ''
+    _nneg_tag = f'_k{args.n_neg}' if args.n_neg > 1 else ''
     _warm_tag  = f'_warm{args.lambda_mi_warmup}' if args.lambda_mi_warmup > 0 else ''
     _nmod_tag  = '_nomodal' if args.no_modal else ''
+    _nimg_tag  = '_noimg'    if args.no_image       else ''
+    _ntxt_tag  = '_notxt'    if args.no_text        else ''
+    _alpha_tag = '_alpha1'   if args.force_alpha_one else ''
     _run_tag   = f'_{args.run_tag}' if args.run_tag else ''
-    args.model_save_path = f'model_save/{args.dataset_name}/{args.model_short_name}_layers_{args.num_layers}_seed{args.seed}{_l2_tag}{_bs_tag}{_mi_tag}{_dp_tag}{_neg_tag}{_nneg_tag}{_warm_tag}{_nmod_tag}{_run_tag}.pt'
+    args.model_save_path = f'model_save/{args.dataset_name}/{args.model_short_name}_layers_{args.num_layers}_seed{args.seed}{_l2_tag}{_bs_tag}{_mi_tag}{_dp_tag}{_neg_tag}{_nneg_tag}{_warm_tag}{_nmod_tag}{_nimg_tag}{_ntxt_tag}{_alpha_tag}{_run_tag}.pt'
     if not os.path.isdir(f'model_save/{args.dataset_name}'):
         os.makedirs(f'model_save/{args.dataset_name}')
 
@@ -243,13 +248,15 @@ class MultiLayerHeteroGraphConv(nn.Module):
         self.item_embedding = nn.Parameter(torch.Tensor(item_size, msg_units))
         nn.init.xavier_uniform_(self.item_embedding.unsqueeze(0)).squeeze(0)
         self.h_modal = None  # sera injecté depuis ModalEncoder
-        self.item_degree_tensor = None  # injecté depuis l'extérieur
-        # Gate MLP : entrée = [item_collab_post_gcn (msg_units) | degree_norm (1)]
-        # Petit degré (cold) → alpha petit → plus de modal dans la late fusion.
-        self.gate_mlp = nn.Sequential(
-            nn.Linear(msg_units + 1, 64),
+        self.item_degree_tensor = None  # sera injecté depuis l'extérieur
+        self.force_alpha_one = False  # ablation : alpha=1 → item_init = item_collab
+        self.w_deg = nn.Parameter(torch.tensor(2.0))
+        self.b_deg = nn.Parameter(torch.tensor(-5.0))
+        self.gate_residual = nn.Sequential(
+            nn.Linear(msg_units * 2, 32),
             nn.ReLU(),
-            nn.Linear(64, 1),
+            nn.Linear(32, 1),
+            nn.Tanh()
         )
 
         sub_conv = nn.ModuleDict()
@@ -280,12 +287,11 @@ class MultiLayerHeteroGraphConv(nn.Module):
         
 
     def forward(self, input_nodes, encoder_blocks):
-
+        
         user_outputs = []
         item_outputs = []
-        _item_collab_out = None  # collab embedding (raw) sauvé pour le gate post-GNN
-        _item_modal_out  = None  # h_modal sauvé pour le blend post-GNN
 
+        # first layer
         for l in range(len(self.conv_layers)):
             u_layer_output = dict()
             m_layer_output = dict()
@@ -295,15 +301,33 @@ class MultiLayerHeteroGraphConv(nn.Module):
 
             for rating in self.rating_values:
 
-                if l == 0:
-                    i_o = conv_layer[rating](block['user', rating, 'item'],
+                if l == 0: 
+                    i_o = conv_layer[rating](block['user', rating, 'item'], 
                                              self.user_embedding[input_nodes['user']])
                     item_collab = self.item_embedding[input_nodes['item']]
-                    if _item_collab_out is None:  # sauver une fois pour le placeholder eval
-                        _item_collab_out = item_collab
-                    # GNN voit uniquement le signal collaboratif (pure late fusion)
-                    u_o = conv_layer[f'rev-{rating}'](block['item', f'rev-{rating}', 'user'],
-                                                      item_collab)
+                    item_modal  = self.h_modal[input_nodes['item']]
+                    degrees = self.item_degree_tensor[input_nodes['item']]
+                    if self.force_alpha_one:
+                        alpha = torch.ones(item_collab.shape[0], 1, device=item_collab.device)
+                    else:
+                        alpha_deg = torch.sigmoid(torch.abs(self.w_deg) * torch.log1p(degrees) + self.b_deg).unsqueeze(-1)
+                        gate_input = torch.cat([item_collab, item_modal], dim=-1)
+                        residual = self.gate_residual(gate_input) * 0.2
+                        alpha = torch.clamp(alpha_deg + residual, 0.0, 1.0)
+                    item_init   = alpha * item_collab + (1 - alpha) * item_modal
+                    if self.training:
+                        self._last_alpha   = alpha.squeeze(-1)
+                        self._last_degrees = degrees
+                    if not self.training:
+                        _iids_cpu = input_nodes['item'].cpu()
+                        # Contribution reelle modal vs collab (norme)
+                        _modal_contrib  = ((1 - alpha) * item_modal).norm(dim=-1).detach().cpu()
+                        _collab_contrib = (alpha * item_collab).norm(dim=-1).detach().cpu()
+                        _ratio_modal    = _modal_contrib / (_modal_contrib + _collab_contrib + 1e-8)
+                        if not hasattr(self, '_alpha_buffer'): self._alpha_buffer = []
+                        self._alpha_buffer.extend(zip(_iids_cpu.tolist(), _ratio_modal.tolist()))
+                    u_o = conv_layer[f'rev-{rating}'](block['item', f'rev-{rating}', 'user'], 
+                                                      item_init)
                 else:
                     _u_feats = user_outputs[-1][rating]
                     _i_feats = item_outputs[-1][rating]
@@ -319,50 +343,11 @@ class MultiLayerHeteroGraphConv(nn.Module):
 
         user_outputs = sum(list(user_outputs[-1].values()))
         item_outputs = sum(list(item_outputs[-1].values()))
-
-        # Fix : _degree_norm_out et _item_modal_out depuis les seed items uniquement.
-        # input_nodes['item'] contient tout le k-hop voisinage (>> seed items), ce qui
-        # causait un mismatch de taille dans le torch.cat suivant.
-        _seed_gids       = encoder_blocks[-1].dstdata['_ID']['item']
-        _degrees_out     = self.item_degree_tensor[_seed_gids]
-        _degree_norm_out = (_degrees_out / self.item_degree_tensor.max().clamp(min=1.0)).unsqueeze(-1)
-        _item_modal_out  = self.h_modal[_seed_gids]
-
+        # user_outputs = user_outputs.sum(1)
         user_outputs = self.agg_act(user_outputs)
         user_outputs = self.dropout(user_outputs)
         user_outputs = self.ufc(user_outputs)
-
-        # Late fusion : alpha appris depuis [post-GCN collab | degree_norm].
-        # Petit degré (cold) → alpha petit → plus de modal.
-        # Grand degré (warm) → alpha grand → plus de collab.
-        _gate_input = torch.cat([item_outputs, _degree_norm_out], dim=-1)  # (n, 129)
-        alpha = torch.sigmoid(self.gate_mlp(_gate_input))  # (n, 1)
-        if self.training:
-            self._last_alpha = alpha.squeeze(-1).detach()
-            self._gate_step = getattr(self, '_gate_step', 0) + 1
-            if self._gate_step % 100 == 1:
-                _cold_mask = (_degrees_out >= 5) & (_degrees_out <= 10)
-                _warm_mask = _degrees_out > 20
-                if _cold_mask.any() and _warm_mask.any():
-                    _a = alpha.squeeze(-1).detach()
-                    _ac = _a[_cold_mask].mean().item()
-                    _aw = _a[_warm_mask].mean().item()
-                    _status = 'OK cold<warm' if _ac < _aw else 'WARN: cold>=warm'
-                    print(
-                        f"[GATE_BATCH] step={self._gate_step}"
-                        f"  alpha cold={_ac:.3f}  warm={_aw:.3f}"
-                        f"  [{_status}]"
-                        f"  n_cold={_cold_mask.sum().item()} n_warm={_warm_mask.sum().item()}",
-                        flush=True
-                    )
-        if not self.training:
-            _iids_cpu = _item_collab_out.new_zeros(0).long()  # placeholder
-            _modal_contrib  = ((1 - alpha) * _item_modal_out).norm(dim=-1).detach().cpu()
-            _collab_contrib = (alpha * item_outputs).norm(dim=-1).detach().cpu()
-            _ratio_modal    = _modal_contrib / (_modal_contrib + _collab_contrib + 1e-8)
-            if not hasattr(self, '_alpha_buffer'): self._alpha_buffer = []
-            self._alpha_buffer.extend(_ratio_modal.tolist())
-        item_outputs = alpha * item_outputs + (1 - alpha) * _item_modal_out
+        # item_outputs = item_outputs.sum(1)
         item_outputs = self.agg_act(item_outputs)
         item_outputs = self.dropout(item_outputs)
         item_outputs = self.ifc(item_outputs)
@@ -575,7 +560,7 @@ class SentenceRetrival(nn.Module):
                                     pos_sid.shape, device=pos_sid.device)
             neg_review = self.get_review_feature(neg_sid)
             neg_score = (th * neg_review).sum(1)
-            losses.append(-(pos_score - neg_score).sigmoid().log())
+            losses.append(-F.logsigmoid(pos_score - neg_score))
         loss = torch.stack(losses, dim=0).mean(0)
         return {'mi_score': loss, 'ranking_loss': loss}
 
@@ -613,7 +598,7 @@ class SentenceRetrival(nn.Module):
                 diag = torch.eye(N, dtype=torch.bool, device=th.device)
                 score_mat = score_mat.masked_fill(diag, float('-inf'))
                 pos_exp = pos_score.unsqueeze(1).expand(N, N)
-                bpr = -(pos_exp - score_mat).sigmoid().log()
+                bpr = -F.logsigmoid(pos_exp - score_mat)
                 bpr = bpr.masked_fill(diag, 0.0)
                 loss = bpr.sum(1) / (N - 1)
                 mi = loss.mean()
@@ -758,6 +743,7 @@ class Net(nn.Module):
                                                         params.num_layers, \
                                                         dropout_rate=params.gcn_dropout)
 
+        self.rating_encoder.force_alpha_one = params.force_alpha_one
         self.topic_encoder = TopicGraphEncoder(self.sentence_embedding, params.global_topic_size, params.gcn_out_units)
         self.topic_decoder = SentenceRetrival(params.gcn_out_units, 5, self.review_embedding, self.sentence_embedding)
 
@@ -784,7 +770,8 @@ class Net(nn.Module):
                   topic_input_nodes,
                   topic_encoder_blocks,
                   pos_graph,
-                  sample_weight=None):
+                  sample_weight=None,
+                  pre_neg_ids=None):
         self.train()
 
         urf, irf = self.rating_encoder(rating_input_nodes, rating_encoder_blocks)
@@ -797,49 +784,67 @@ class Net(nn.Module):
                                                  neg_strategy=self.neg_strategy,
                                                  n_neg=self.n_neg)
 
-        # BPR avec in-batch negatives :
-        # pour chaque paire (u_i, pos_i), le négatif est pos_{perm(i)} (item d'une autre paire du batch)
         src_pos, dst_pos = pos_graph.edges()
         u_emb     = urf[src_pos]
         i_pos_emb = irf[dst_pos]
 
         N = i_pos_emb.shape[0]
-        perm = torch.randperm(N, device=i_pos_emb.device)
-        clash = perm == torch.arange(N, device=i_pos_emb.device)
-        if clash.any():
-            perm[clash] = (perm[clash] + 1) % N
-        i_neg_emb = i_pos_emb[perm]
-
-        h_pos = self.topic_decoder.rating_linear(torch.cat([u_emb, i_pos_emb], dim=1))
-        h_neg = self.topic_decoder.rating_linear(torch.cat([u_emb, i_neg_emb], dim=1))
+        h_pos     = self.topic_decoder.rating_linear(torch.cat([u_emb, i_pos_emb], dim=1))
         score_pos = self.topic_decoder.item_scorer(h_pos).squeeze(-1)
-        score_neg = self.topic_decoder.item_scorer(h_neg).squeeze(-1)
 
         ratings = pos_graph.edata['rating'].float()
         weight  = ratings / 5.0
         if sample_weight is not None:
             weight = weight * sample_weight
             weight = weight / (weight.mean() + 1e-9)
-        bpr_loss = -(weight * F.logsigmoid(score_pos - score_neg)).mean()
+
+        bpr_terms = []
+        if pre_neg_ids is not None:
+            # Per-epoch uniform : négatifs pré-samplés depuis tout le catalogue au début de l'époque
+            # i_neg = item_embedding brut (pre-GCN) — approximation standard pour négatifs hors-batch
+            all_item_emb = self.rating_encoder.item_embedding
+            for j in range(self.n_neg):
+                i_neg_raw = all_item_emb[pre_neg_ids[:, j]]
+                h_neg     = self.topic_decoder.rating_linear(torch.cat([u_emb, i_neg_raw], dim=1))
+                score_neg = self.topic_decoder.item_scorer(h_neg).squeeze(-1)
+                bpr_terms.append(F.logsigmoid(score_pos - score_neg))
+            _last_neg_ids = pre_neg_ids[:, -1]
+        else:
+            # Fallback in-batch : k permutations indépendantes
+            arange = torch.arange(N, device=i_pos_emb.device)
+            perm = None
+            for _ in range(self.n_neg):
+                perm = torch.randperm(N, device=i_pos_emb.device)
+                clash = perm == arange
+                if clash.any():
+                    perm[clash] = (perm[clash] + 1) % N
+                i_neg_emb = i_pos_emb[perm]
+                h_neg     = self.topic_decoder.rating_linear(torch.cat([u_emb, i_neg_emb], dim=1))
+                score_neg = self.topic_decoder.item_scorer(h_neg).squeeze(-1)
+                bpr_terms.append(F.logsigmoid(score_pos - score_neg))
+            _last_neg_ids = pos_graph.nodes['item'].data['_ID'][dst_pos[perm]] if perm is not None else None
+
+        bpr_loss = -(weight * torch.stack(bpr_terms).mean(0)).mean()
         l2_reg = self.lambda_l2 * (
             self.rating_encoder.user_embedding.norm(2).pow(2) +
             self.rating_encoder.item_embedding.norm(2).pow(2)
         ) / u_emb.shape[0]
         bpr_loss = bpr_loss + l2_reg
 
-        # BPR diagnostic — premiers batches + tous les 100 steps
+        # BPR diagnostic
         self._bpr_step = getattr(self, '_bpr_step', 0) + 1
         if self._bpr_step <= 10 or self._bpr_step % 100 == 0:
             with torch.no_grad():
                 diff = score_pos.detach() - score_neg.detach()
-                _neg_global = pos_graph.nodes['item'].data['_ID'][dst_pos[perm]]
-                _neg_deg    = self.rating_encoder.item_degree_tensor[_neg_global].float()
-                _rat_dist   = ratings.long().bincount(minlength=6)[1:].tolist()
+                _neg_deg = self.rating_encoder.item_degree_tensor[_last_neg_ids].float() \
+                           if _last_neg_ids is not None else torch.zeros(1)
+                _rat_dist = ratings.long().bincount(minlength=6)[1:].tolist()
+                _mode = 'epoch_uniform' if pre_neg_ids is not None else 'inbatch'
                 print(
-                    f"[BPR_DEBUG] step={self._bpr_step}"
+                    f"[BPR_DEBUG] step={self._bpr_step} mode={_mode} n_neg={self.n_neg}"
                     f" | diff mean={diff.mean():.4f} std={diff.std():.4f}"
                     f" | pos={score_pos.detach().mean():.4f} neg={score_neg.detach().mean():.4f}"
-                    f" | weight mean={weight.mean():.3f} min={weight.min():.3f} max={weight.max():.3f}"
+                    f" | weight mean={weight.mean():.3f}"
                     f" | neg_deg mean={_neg_deg.mean():.1f} min={_neg_deg.min():.0f} max={_neg_deg.max():.0f}"
                     f" | rating_dist(1..5)={_rat_dist}",
                     flush=True
@@ -848,17 +853,17 @@ class Net(nn.Module):
         return bpr_loss, ed_mi, ranking_loss, urf, irf
 
     def _get_item_emb_global(self, global_iids):
-        """Représentation approchée pour items hors-batch (sans propagation GNN).
-        Cohérent avec la late fusion de forward() : collab embedding comme proxy GNN output.
-        """
-        collab   = self.rating_encoder.item_embedding[global_iids]
-        modal    = self.rating_encoder.h_modal[global_iids]
-        deg      = self.rating_encoder.item_degree_tensor[global_iids]
-        deg_max  = self.rating_encoder.item_degree_tensor.max().clamp(min=1.0)
-        deg_norm = (deg / deg_max).unsqueeze(-1)
-        gate_in  = torch.cat([collab, deg_norm], dim=-1)
-        alpha    = torch.sigmoid(self.rating_encoder.gate_mlp(gate_in))
-        emb      = alpha * collab + (1 - alpha) * modal
+        """Représentation approchée pour items hors-batch (sans propagation GNN)."""
+        collab  = self.rating_encoder.item_embedding[global_iids]
+        modal   = self.rating_encoder.h_modal[global_iids]
+        deg     = self.rating_encoder.item_degree_tensor[global_iids]
+        alpha   = torch.sigmoid(
+            torch.abs(self.rating_encoder.w_deg) * torch.log1p(deg) + self.rating_encoder.b_deg
+        ).unsqueeze(-1)
+        gate_in = torch.cat([collab, modal], dim=-1)
+        res     = self.rating_encoder.gate_residual(gate_in) * 0.2
+        alpha   = torch.clamp(alpha + res, 0.0, 1.0)
+        emb     = alpha * collab + (1 - alpha) * modal
         return self.rating_encoder.ifc(self.rating_encoder.agg_act(emb))
 
     @torch.no_grad()
@@ -1010,8 +1015,8 @@ class Net(nn.Module):
         Fusion Loss (CFMM Eq.6 adapté).
         Supervise h_modal avec les préférences users directement.
         user_emb    : (n, 128) — représentations users (urf) pour interactions positives
-        h_modal_pos : (n, 128) — h_modal des items vus (tous ratings)
-        h_modal_neg : (n, 128) — h_modal des items vus par d'autres users (in-batch permutation)
+        h_modal_pos : (n, 128) — h_modal des items aimés (rating >= 3)
+        h_modal_neg : (n, 128) — h_modal des items non aimés (rating <= 2)
         """
         pos_score = (user_emb * h_modal_pos).sum(dim=-1)
         neg_score = (user_emb * h_modal_neg).sum(dim=-1)
@@ -1077,15 +1082,28 @@ def train(params):
 
     net = Net(dataset.review_embedding, dataset.sentence_embedding, params)
     net = net.to(params.device)
+    with torch.no_grad():
+        net.rating_encoder.w_deg.fill_(params.w_deg_init)
+        net.rating_encoder.b_deg.fill_(params.b_deg_init)
    # === MODAL ENCODER ===
     v_feat, t_feat = load_modal_features('/home/infres/belguith/PFE/bm3_data/musical')
-    modal_enc = ModalEncoder(v_feat, t_feat, embed_dim=params.gcn_out_units).to(params.device)
+    modal_enc = ModalEncoder(v_feat, t_feat, embed_dim=params.gcn_out_units,
+                             use_image=not params.no_image,
+                             use_text=not params.no_text).to(params.device)
+    print(f"[ABL_MODAL] use_image={not params.no_image}  use_text={not params.no_text}", flush=True)
 # =====================
     learning_rate = params.train_lr
     optimizer = torch.optim.Adam(
       list(net.parameters()) + list(modal_enc.parameters()),
       lr=learning_rate
     )
+    if params.cosine_lr:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=params.epoch, eta_min=1e-4
+        )
+        print(f"[LR] CosineAnnealingLR: {params.train_lr} → 1e-4 over {params.epoch} epochs", flush=True)
+    else:
+        scheduler = None
     logger.info("Loading network finished ...\n")
 
     train_dataloader, valid_dataloader, test_dataloader = dataset.get_dataloaders(batch_size=params.batch_size, num_layers=params.num_layers)
@@ -1113,12 +1131,11 @@ def train(params):
        print(f"[Modal] h_v={h_v.norm(dim=-1).mean():.4f} | h_t={h_t.norm(dim=-1).mean():.4f}") 
     net.rating_encoder.h_modal = h_modal
     with torch.no_grad():
-        _n_items = net.rating_encoder.item_embedding.shape[0]
-        _modal_avg_norm = h_modal[:_n_items].norm(dim=-1).mean()
-        _rand_emb = torch.randn(_n_items, params.gcn_out_units, device=params.device)
-        _rand_emb = F.normalize(_rand_emb, dim=-1) * _modal_avg_norm
-        net.rating_encoder.item_embedding.data.copy_(_rand_emb)
-    print(f"[INIT] item_embedding aléatoire à norme={_modal_avg_norm:.3f} (même échelle que h_modal)")
+        h_modal_norm = F.normalize(h_modal, p=2, dim=-1)
+        net.rating_encoder.item_embedding.data.copy_(
+            h_modal_norm[:net.rating_encoder.item_embedding.shape[0]]
+        )
+    print(f"[INIT] item_embedding initialisé depuis h_modal normalisé (norme avant={h_modal.norm(dim=-1).mean():.3f} → après=1.0)")
     import pandas as pd
     _df_deg_train = pd.read_csv('/home/infres/belguith/PFE/processed/Musical_interactions_reviews.csv')
     _deg_train = _df_deg_train['iid'].value_counts()
@@ -1148,8 +1165,17 @@ def train(params):
         repr_norm_history.append((0, _u0, _i0, _r0))
         print(f"[REPR_NORM] epoch=  0  user={_u0:.4f}  item={_i0:.4f}  ratio_u/i={_r0:.4f}  (INIT - avant training)", flush=True)
 
+    # Nombre total d'arêtes d'entraînement (pour le pre-sampling per-epoch)
+    _n_train_edges = dataset.graph.num_edges(('user', 'train', 'item'))
+    _n_items       = net.rating_encoder.item_embedding.shape[0]
+    print(f"[EPOCH_NEG] n_train_edges={_n_train_edges}, n_items={_n_items}, k={params.n_neg}", flush=True)
+
     for iter_idx in range(1, params.epoch):
         net.train()
+
+        # Pre-sample k négatifs uniformes (catalogue complet) pour chaque arête d'entraînement
+        # Shape : (n_train_edges, k) — renouvelé à chaque époque
+        epoch_neg_ids = torch.randint(0, _n_items, (_n_train_edges, params.n_neg))  # CPU
 
         pbar = tqdm(train_dataloader)
         # pbar = train_dataloader
@@ -1167,39 +1193,56 @@ def train(params):
             topic_blocks       = [b.to(params.device) for b in topic_blocks]
 
             if params.no_modal:
-                h_modal = torch.zeros(net.rating_encoder.item_embedding.weight.shape[0],
+                h_modal = torch.zeros(net.rating_encoder.item_embedding.shape[0],
                                       params.gcn_out_units, device=params.device)
                 h_v = h_t = h_modal
             else:
                 h_modal, h_v, h_t = modal_enc()
             net.rating_encoder.h_modal = h_modal
 
+            # Poids cold-start : upweight les interactions des items peu vus
+            _, _dst_idx = pos_graph_train.edges()
+            _edge_iids     = pos_graph_train.dstdata['_ID'][_dst_idx]
+            _edge_degrees  = net.rating_encoder.item_degree_tensor[_edge_iids].clamp(min=1.0)
+            _median_deg    = net.rating_encoder.item_degree_tensor[net.rating_encoder.item_degree_tensor > 0].median()
+            _sample_weight = torch.log1p(_median_deg / _edge_degrees)
+            _sample_weight = _sample_weight / _sample_weight.mean()
+
+            # Récupérer les IDs globaux d'arêtes pour ce batch → indexer epoch_neg_ids
+            _edge_gids = pos_graph_train.edata.get('_ID', None)
+            if _edge_gids is not None:
+                batch_neg_ids = epoch_neg_ids[_edge_gids.cpu()].to(params.device)
+            else:
+                batch_neg_ids = None  # fallback in-batch si _ID absent
+
             r_loss, mi_score, ranking_loss, urf, irf = net.calc_loss(
                 rating_input_nodes, rating_blocks,
                 topic_input_nodes, topic_blocks,
                 pos_graph_train,
+                sample_weight=_sample_weight,
+                pre_neg_ids=batch_neg_ids
             )
 
             batch_items = pos_graph_train.nodes['item'].data['_ID']
-            modal_loss  = torch.tensor(0.0, device=params.device) if params.no_modal else \
+            _abl_disable = params.no_modal or params.no_image or params.no_text
+            modal_loss  = torch.tensor(0.0, device=params.device) if _abl_disable else \
                           modal_enc.calculate_loss_infonce(h_v, h_t, batch_items)
 
-            # Fusion Loss — BPR sur embeddings modaux, négatifs in-batch (items vus par d'autres users)
+            # Fusion Loss — BPR sur embeddings modaux (rating >= 3 pos, <= 2 neg)
             _src_idx_f, _dst_idx_f = pos_graph_train.edges()
+            _ratings_batch    = pos_graph_train.edata['rating']
             _item_gids_f      = pos_graph_train.dstdata['_ID'][_dst_idx_f]
             _u_emb_per_edge   = urf[_src_idx_f]
             _h_modal_per_edge = h_modal[_item_gids_f]
+            _mask_pos = _ratings_batch >= 3
+            _mask_neg = _ratings_batch <= 2
             f_loss = torch.tensor(0.0, device=params.device)
-            _n_f = _h_modal_per_edge.shape[0]
-            if not params.no_modal and _n_f > 1:
-                _perm_f = torch.randperm(_n_f, device=params.device)
-                _clash  = _perm_f == torch.arange(_n_f, device=params.device)
-                if _clash.any():
-                    _perm_f[_clash] = (_perm_f[_clash] + 1) % _n_f
+            if not _abl_disable and _mask_pos.sum() > 0 and _mask_neg.sum() > 0:
+                _n_f = min(_mask_pos.sum().item(), _mask_neg.sum().item())
                 f_loss = net.compute_fusion_loss(
-                    _u_emb_per_edge,
-                    _h_modal_per_edge,
-                    _h_modal_per_edge[_perm_f],
+                    _u_emb_per_edge[_mask_pos][:_n_f],
+                    _h_modal_per_edge[_mask_pos][:_n_f],
+                    _h_modal_per_edge[_mask_neg][:_n_f],
                     lambda_f=params.lambda_f
                 )
 
@@ -1239,15 +1282,12 @@ def train(params):
             # DIAG cosine similarity
             _sim = torch.nn.functional.cosine_similarity(_h[:_n], _e).mean()
             print(f"[DIAG] cosine sim h_modal/collab = {_sim:.4f}", flush=True)
-            # GATE monitor — alpha appris depuis [collab | degree_norm]
-            _deg_all  = net.rating_encoder.item_degree_tensor[:_n]
-            _deg_max  = net.rating_encoder.item_degree_tensor.max().clamp(min=1.0)
-            _deg_norm = (_deg_all / _deg_max).unsqueeze(-1).to(_e.device)
-            _gate_in  = torch.cat([_e, _deg_norm], dim=-1)
-            _alpha = torch.sigmoid(net.rating_encoder.gate_mlp(_gate_in)).detach()  # (n, 1)
-            print(f"[GATE] epoch={iter_idx} mean={_alpha.mean():.3f} std={_alpha.std():.3f} min={_alpha.min():.3f} max={_alpha.max():.3f}", flush=True)
-            _corr = torch.corrcoef(torch.stack([_alpha.squeeze(-1), _deg_all.to(_e.device)]))[0,1].item()
-            print(f"[GATE_CORR] alpha vs degree={_corr:.4f} (>0 = warm→plus collab, attendu)", flush=True)
+            # GATE monitor
+            _degrees_all = net.rating_encoder.item_degree_tensor[:_n]
+            _alpha = torch.sigmoid(torch.abs(net.rating_encoder.w_deg) * torch.log1p(_degrees_all) + net.rating_encoder.b_deg).unsqueeze(-1)
+            _std_items = _alpha.std(dim=0).mean()
+            _std_dims  = _alpha.std(dim=1).mean()
+            print(f"[GATE] epoch={iter_idx} mean={_alpha.mean():.3f} std_global={_alpha.std():.3f} std_inter_items={_std_items:.3f} std_inter_dims={_std_dims:.3f} min={_alpha.min():.3f} max={_alpha.max():.3f}", flush=True)
 
             # DIAG 1 : est-ce que img/txt convergent vers 0 ou 1 ?
             _w = torch.softmax(torch.cat([
@@ -1265,24 +1305,50 @@ def train(params):
                 _w_std = _ww[:,0].std().item()
             print(f"[EPOCH_MODAL] epoch={iter_idx} w_img={_w_img:.3f} w_txt={_w_txt:.3f} std={_w_std:.3f} {'⚠ COLLAPSE' if _w_img > 0.95 or _w_txt > 0.95 else 'OK'}", flush=True)
 
-            # DIAG : contribution modale late fusion — norme de (1-alpha)*h_modal vs alpha*collab
+            # DIAG 2 : corrélation alpha / degré des items
+            _item_ids = torch.arange(_e.shape[0])
+            _degrees  = torch.tensor([
+                net.rating_encoder.item_embedding.shape[0]
+            ] * _e.shape[0]).float()  # placeholder
+            # Vraie corrélation alpha_mean vs norme collab (proxy du degré)
+            _alpha_mean_per_item = _alpha.mean(dim=-1)  # [n_items]
+            _collab_norm_per_item = _e.norm(dim=-1)     # [n_items]
+            _corr = torch.corrcoef(torch.stack([
+                _alpha_mean_per_item, _collab_norm_per_item
+            ]))[0,1].item()
+            print(f"[CORR] alpha vs collab_norm = {_corr:.4f} {'(gate discrimine par confiance collab)' if abs(_corr) > 0.1 else '(gate independant de la norme collab)'}", flush=True)
+
+            # DIAG 3 : contribution modale — norme de (1-alpha)*h_modal vs alpha*collab
             _modal_contrib  = ((1 - _alpha) * _h[:_n]).norm(dim=-1).mean().item()
             _collab_contrib = (_alpha * _e).norm(dim=-1).mean().item()
             print(f"[CONTRIB] collab={_collab_contrib:.3f} modal={_modal_contrib:.3f} ratio_modal={_modal_contrib/(_modal_contrib+_collab_contrib)*100:.1f}%", flush=True)
 
-            # ── DIAG COLD vs WARM : alpha gate appris ────────────────────────────
+            # ── DIAG COLD-START : les 3 hypothèses ──────────────────────────────
+
+            # [H1] collab ≈ modal pour cold ? → si oui, gate est vacuité
             _c_idx = _diag_cold_idx.to(_e.device)
             _w_idx = _diag_warm_idx.to(_e.device)
-            _gate_in_cold = torch.cat([_e[_c_idx], _deg_norm[_c_idx]], dim=-1)
-            _gate_in_warm  = torch.cat([_e[_w_idx],  _deg_norm[_w_idx]],  dim=-1)
-            _alpha_cold = torch.sigmoid(net.rating_encoder.gate_mlp(_gate_in_cold)).detach()
-            _alpha_warm  = torch.sigmoid(net.rating_encoder.gate_mlp(_gate_in_warm)).detach()
-            print(f"[GATE_COLDWARM] epoch={iter_idx}", flush=True)
-            print(f"  alpha cold={_alpha_cold.mean():.3f}±{_alpha_cold.std():.3f}  warm={_alpha_warm.mean():.3f}±{_alpha_warm.std():.3f}", flush=True)
-            print(f"  (cold alpha < warm alpha → gate apprend bien le proxy degré)", flush=True)
             _sim_cold = torch.nn.functional.cosine_similarity(_e[_c_idx], _h[_c_idx], dim=-1).mean().item()
             _sim_warm  = torch.nn.functional.cosine_similarity(_e[_w_idx],  _h[_w_idx],  dim=-1).mean().item()
+            # item_init pour cold/warm
+            _alpha_cold = torch.sigmoid(2.0 * torch.log1p(_diag_deg[_diag_cold_idx].to(_e.device)) - 5.0).unsqueeze(-1)
+            _alpha_warm  = torch.sigmoid(2.0 * torch.log1p(_diag_deg[_diag_warm_idx].to(_e.device))  - 5.0).unsqueeze(-1)
+            _init_cold = _alpha_cold * _e[_c_idx] + (1 - _alpha_cold) * _h[_c_idx]
+            _init_warm  = _alpha_warm  * _e[_w_idx]  + (1 - _alpha_warm)  * _h[_w_idx]
+            _sim_init_cold = torch.nn.functional.cosine_similarity(_init_cold, _h[_c_idx], dim=-1).mean().item()
+            _sim_init_warm  = torch.nn.functional.cosine_similarity(_init_warm,  _h[_w_idx],  dim=-1).mean().item()
+            print(f"[H1_GATE_VACUITE] epoch={iter_idx}", flush=True)
             print(f"  cosine_sim(collab, modal): cold={_sim_cold:.4f}  warm={_sim_warm:.4f}", flush=True)
+            print(f"  cosine_sim(item_init, modal): cold={_sim_init_cold:.4f}  warm={_sim_init_warm:.4f}  (cold proche 1.0 → gate vacuité)", flush=True)
+
+            # [H2] cold_reg supprimé (FIX1) — on log f_loss à la place
+            print(f"[H2_FUSION_LOSS] epoch={iter_idx} f_loss={f_loss.item():.6f}", flush=True)
+
+            # [H3] drift item_emb depuis h_modal — cold vs warm
+            _drift_cold = (_e[_c_idx] - _h[_c_idx]).norm(dim=-1).mean().item()
+            _drift_warm  = (_e[_w_idx]  - _h[_w_idx]).norm(dim=-1).mean().item()
+            print(f"[H3_DRIFT] epoch={iter_idx} ||collab - modal||: cold={_drift_cold:.4f}  warm={_drift_warm:.4f}", flush=True)
+            print(f"  (si cold_drift ≈ warm_drift → collab n'apprend rien de spécifique aux cold items)", flush=True)
             # ────────────────────────────────────────────────────────────────────
 
             # --- Comparaison norme user vs item (représentations finales pour la prédiction) ---
@@ -1329,7 +1395,7 @@ def train(params):
             if no_better_valid > params.train_early_stopping_patience and learning_rate <= params.train_min_lr:
                 logger.info("Early stopping threshold reached. Stop training.")
                 break
-            if no_better_valid > params.train_decay_patience:
+            if not params.cosine_lr and no_better_valid > params.train_decay_patience:
                 new_lr = max(learning_rate * params.train_lr_decay_factor, params.train_min_lr)
                 if new_lr < learning_rate:
                     learning_rate = new_lr
@@ -1337,6 +1403,10 @@ def train(params):
                     for p in optimizer.param_groups:
                         p['lr'] = learning_rate
                     no_better_valid = 0
+
+        if scheduler is not None:
+            scheduler.step()
+            learning_rate = optimizer.param_groups[0]['lr']
 
         logger.info(logging_str)
         logger.info('Test - ' + format_dict_to_str(net.evaluate_sentence_ranking(test_dataloader, graph, topic_sampler, etype='test')))
@@ -1360,8 +1430,8 @@ def train(params):
 
 
 def test(params):
-    """Déplacé dans evaluate_model_run.py — conservé ici pour compatibilité ascendante."""
-    from evaluate_model_run import test as _eval_test
+    """Évaluation correcte pour les ablations — utilise eval_abl_modal (Net + ModalEncoder ablation)."""
+    from eval_abl_modal import test as _eval_test
     _eval_test(params)
 
 
@@ -1390,7 +1460,7 @@ def _test_legacy(params):
     net.load_state_dict(_ckpt, strict=False)
     net = net.to(params.device)
     # Initialise h_modal pour test() — charger les poids entraînés
-    from modal_encoder import ModalEncoder, load_modal_features
+    from modal_encoder_abl import ModalEncoder, load_modal_features
     v_feat, t_feat = load_modal_features('/home/infres/belguith/PFE/bm3_data/musical')
     _modal_enc_test = ModalEncoder(v_feat, t_feat, embed_dim=128).to(params.device)
     if _modal_sd is not None:
@@ -1499,9 +1569,6 @@ def calc_rouge_metric(predict_list, true_list):
 
 if __name__ == '__main__':
     config_args = config()
-    if config_args.test_only:
-        test(config_args)
-    else:
-        train(config_args)
-        test(config_args)
+    train(config_args)
+    test(config_args)
 

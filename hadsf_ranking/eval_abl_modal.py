@@ -1,6 +1,10 @@
 # -*- coding: utf-8 -*-
-# Évaluation finale — charge le meilleur checkpoint et donne les métriques de test
-# Usage : python evaluate_model_run.py
+# Évaluation du checkpoint ablation (noimg / notxt / force_alpha_one)
+# Usage : python eval_abl_modal.py --no_image --no_text --force_alpha_one \
+#                                   --model_save_path <chemin.pt> \
+#                                   --seed 42 --num_layers 2 --batch_size 512 \
+#                                   --lambda_l2 0.0001 --lambda_mi 0.01 \
+#                                   --neg_strategy inbatch --lambda_mi_warmup 20
 
 import sys
 sys.path.append("/home/infres/belguith/PFE")
@@ -11,15 +15,10 @@ import numpy as np
 import pandas as pd
 from collections import defaultdict
 
-from model_run import config, Net as _DefaultNet, get_logger
+from model_run_abl_modal import config, Net, get_logger
 from rhg_data import GraphData
-from modal_encoder import ModalEncoder, load_modal_features
+from modal_encoder_abl import ModalEncoder, load_modal_features
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Item Ranking — métriques RecSys standard (nDCG, Recall, HR, Precision)
-# Mode : "test items only" — on rank uniquement les items du test pour chaque user
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _dcg(ranked_ids, relevant, k):
     return sum(
@@ -30,48 +29,34 @@ def _dcg(ranked_ids, relevant, k):
 
 def evaluate_item_ranking(net, test_dataloader, dataset, ks=(5, 10, 20),
                           relevance_threshold=1, n_neg=99):
-    """
-    Pour chaque user du test set :
-      - items positifs = items test avec rating >= relevance_threshold
-      - négatifs = n_neg items aléatoires jamais vus (ni train ni test)
-      - rank positifs + négatifs par score prédit → nDCG@K, Recall@K, HR@K, Precision@K
-
-    n_neg=99 → pool de 100 items par user (protocole standard RecSys).
-    Sorties : métriques globales + par groupe cold/medium/warm.
-    """
     device = net.review_embedding.weight.device
     net.eval()
     rng = np.random.default_rng(42)
 
-    # ── 1. Construire train_seen et test_items par user ───────────────────────
-    train_seen  = defaultdict(set)   # items vus en train
-    test_items  = defaultdict(dict)  # uid → {iid: true_rating}
+    train_seen = defaultdict(set)
+    test_items = defaultdict(dict)
 
     graph = dataset.graph
     train_u, train_i = graph['train'].edges()
     for u, i in zip(train_u.tolist(), train_i.tolist()):
         train_seen[u].add(i)
 
-    # Degré de chaque item en train (nombre d'users distincts)
     item_deg = defaultdict(int)
     for u, items in train_seen.items():
         for i in items:
             item_deg[i] += 1
 
     def _group(iids):
-        """Groupe d'un user selon le degré de ses items positifs (exclusif)."""
         degs = [item_deg.get(i, 0) for i in iids]
         if all(5  <= d <= 10 for d in degs): return 'cold'
         if all(11 <= d <= 20 for d in degs): return 'medium'
         if all(d  > 20       for d in degs): return 'warm'
-        return None  # mixte → exclu du per-group
+        return None
 
-    # ── 2. Collecter embeddings user/item depuis le dataloader ────────────────
-    # On stocke urf et irf par ID global pour scorer les négatifs ensuite
-    user_emb = {}   # uid → tensor (dim,)
-    item_emb = {}   # iid → tensor (dim,)
+    user_emb = {}
+    item_emb = {}
+    records  = []
 
-    records = []  # (uid, iid, pred_score, true_rating)
     with torch.no_grad():
         for input_nodes, pos_graph, neg_graph, blocks in test_dataloader:
             input_nodes_dev    = {k: v.to(device) for k, v in input_nodes.items()}
@@ -100,26 +85,21 @@ def evaluate_item_ranking(net, test_dataloader, dataset, ks=(5, 10, 20),
                 records.append((uid, iid, pred, true))
                 test_items[uid][iid] = true
 
-    # ── 3. Scorer les négatifs via item_scorer directement ───────────────────
     rating_linear = net.topic_decoder.rating_linear.to('cpu')
     item_scorer   = net.topic_decoder.item_scorer.to('cpu')
 
     def score_pairs(u_emb_t, i_embs_t):
-        """u_emb_t: (dim,), i_embs_t: (N, dim) → scores (N,)"""
         u_rep = u_emb_t.unsqueeze(0).expand(i_embs_t.shape[0], -1)
         cat   = torch.cat([u_rep, i_embs_t], dim=1)
-        return item_scorer(rating_linear(cat)).squeeze(-1)   # (N,)
+        return item_scorer(rating_linear(cat)).squeeze(-1)
 
-    # ── 4. Pool de candidats négatifs = items dont on a l'embedding ─────────────
     known_items = np.array(sorted(item_emb.keys()))
 
-    # ── 5. Grouper les records positifs par user ──────────────────────────────
     user_records = defaultdict(list)
     for uid, iid, pred, true in records:
-        user_records[uid].append((iid, true))  # pred ignoré — on rescore via score_pairs
+        user_records[uid].append((iid, true))
 
-    empty_k = {'ndcg': [], 'recall': [], 'hr': [], 'precision': []}
-    results  = {k: {'ndcg': [], 'recall': [], 'hr': [], 'precision': []} for k in ks}
+    results     = {k: {'ndcg': [], 'recall': [], 'hr': [], 'precision': []} for k in ks}
     grp_results = {g: {k: {'ndcg': [], 'recall': [], 'hr': [], 'precision': []}
                         for k in ks}
                    for g in ('cold', 'medium', 'warm', 'non_cold')}
@@ -127,11 +107,9 @@ def evaluate_item_ranking(net, test_dataloader, dataset, ks=(5, 10, 20),
     for uid, items in user_records.items():
         if uid not in user_emb:
             continue
-
         relevant = {iid for iid, true in items if true >= relevance_threshold}
         if not relevant:
             continue
-
         if not all(iid in item_emb for iid in relevant):
             continue
 
@@ -151,9 +129,9 @@ def evaluate_item_ranking(net, test_dataloader, dataset, ks=(5, 10, 20),
         group      = _group(relevant)
 
         for k in ks:
-            hits = sum(1 for iid in ranked_ids[:k] if iid in relevant)
-            dcg  = _dcg(ranked_ids, relevant, k)
-            idcg = sum(1.0 / math.log2(i + 2) for i in range(min(ideal_len, k)))
+            hits   = sum(1 for iid in ranked_ids[:k] if iid in relevant)
+            dcg    = _dcg(ranked_ids, relevant, k)
+            idcg   = sum(1.0 / math.log2(i + 2) for i in range(min(ideal_len, k)))
             ndcg_v = dcg / idcg if idcg > 0 else 0.0
             rec_v  = hits / ideal_len
             hr_v   = 1.0 if hits > 0 else 0.0
@@ -189,13 +167,7 @@ def evaluate_item_ranking(net, test_dataloader, dataset, ks=(5, 10, 20),
     return global_out, grp_out
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Fonction principale de test
-# ─────────────────────────────────────────────────────────────────────────────
-
-def test(params, net_class=None):
-    if net_class is None:
-        net_class = _DefaultNet
+def test(params):
     logger = get_logger(params.model_short_name, None)
 
     dataset = GraphData(params.dataset_name, params.dataset_path)
@@ -212,18 +184,24 @@ def test(params, net_class=None):
     topic_sampler = dataset.get_topic_sentence_sampler()
 
     # ── Chargement du modèle ─────────────────────────────────────────────────
-    net   = net_class(dataset.review_embedding, dataset.sentence_embedding, params)
-    _map = params.device if torch.cuda.is_available() else 'cpu'
-    _ckpt = torch.load(params.model_save_path, weights_only=False, map_location=_map)
+    net   = Net(dataset.review_embedding, dataset.sentence_embedding, params)
+    _ckpt = torch.load(params.model_save_path, weights_only=False)
     _modal_sd = _ckpt.pop('modal_enc', None)
     net.load_state_dict(_ckpt, strict=False)
+
+    # Appliquer force_alpha_one sur le rating_encoder chargé
+    net.rating_encoder.force_alpha_one = params.force_alpha_one
     net = net.to(params.device)
 
-    # ── Chargement modal_encoder entraîné ────────────────────────────────────
+    # ── Chargement modal_encoder avec les bons flags ablation ────────────────
     _dataset_to_modal = {'Musical_HADSF': 'musical', 'Baby_HADSF': 'baby', 'CDs_HADSF': 'cds'}
     _modal_dir = _dataset_to_modal.get(getattr(params, 'dataset_name', 'Musical_HADSF'), 'musical')
     v_feat, t_feat = load_modal_features(f'/home/infres/belguith/PFE/bm3_data/{_modal_dir}')
-    modal_enc_test = ModalEncoder(v_feat, t_feat, embed_dim=128).to(params.device)
+    modal_enc_test = ModalEncoder(
+        v_feat, t_feat, embed_dim=128,
+        use_image=not params.no_image,
+        use_text=not params.no_text
+    ).to(params.device)
     if _modal_sd is not None:
         missing, _ = modal_enc_test.load_state_dict(_modal_sd, strict=False)
         print(f"[LOAD] modal_enc chargé depuis checkpoint", flush=True)
@@ -236,27 +214,20 @@ def test(params, net_class=None):
         h_modal_test, _, _ = modal_enc_test()
     net.rating_encoder.h_modal = h_modal_test
 
-    # ── Degrés + groupes cold/medium/warm ────────────────────────────────────
     _n = net.rating_encoder.item_embedding.shape[0]
     _tr_u, _tr_i = dataset.graph['interacts'].edges()
     _deg_tensor  = torch.zeros(_n, dtype=torch.float32)
     _deg_tensor.scatter_add_(0, _tr_i.long(), torch.ones(_tr_i.shape[0]))
     net.rating_encoder.item_degree_tensor = _deg_tensor.to(params.device)
-    net.item_degree_groups = (
-        set(_deg[(_deg >= 5)  & (_deg <= 10)].index),   # cold
-        set(_deg[(_deg >= 11) & (_deg <= 20)].index),   # medium
-        set(_deg[_deg > 20].index)                       # warm
-    )
     net._cs_buffer = []
 
-    # ═════════════════════════════════════════════════════════════════════════
     print(f'\n{"="*60}')
     print(f'  Dataset    : {params.dataset_name}')
     print(f'  Checkpoint : {params.model_save_path}')
+    print(f'  Ablation   : no_image={params.no_image}  no_text={params.no_text}  force_alpha_one={params.force_alpha_one}')
     print(f'{"="*60}')
 
-    # ── 1. Item Ranking — négatif sampling (99 neg/user, pool=100) ──────────
-    print('\n── [1] ITEM RANKING  (1 pos + 99 neg, rating≥1 = pertinent) ──')
+    print('\n── ITEM RANKING  (1 pos + 99 neg, rating≥1 = pertinent) ──')
     print(f'  {"K":>4}  {"nDCG@K":>8}  {"Recall@K":>9}  {"HR@K":>7}  {"Prec@K":>8}')
     item_rank_scores, grp_rank_scores = evaluate_item_ranking(net, test_dataloader, dataset, ks=(5, 10, 20))
     for k, m in sorted(item_rank_scores.items()):
@@ -266,15 +237,6 @@ def test(params, net_class=None):
         print(f'\n  {label}')
         for k, m in sorted(grp_rank_scores[g].items()):
             print(f'  @{k:<3}  {m["ndcg"]:>8.4f}  {m["recall"]:>9.4f}  {m["hr"]:>7.4f}  {m["precision"]:>8.4f}')
-
-    # ── 2. Sentence Ranking — retrouver la bonne phrase de review ────────────
-    print('\n── [2] SENTENCE RANKING  (retrouver la phrase de review) ─────')
-    print(f'  {"topk":>5}  {"Pre":>7}  {"Rec":>7}  {"F1":>7}  {"nDCG":>7}')
-    for k in [10, 50]:
-        scores = net.evaluate_sentence_ranking(
-            test_dataloader, graph, topic_sampler, etype='test', topk=k
-        )
-        print(f'  @{k:<4}  {scores["Pre"]:>7.4f}  {scores["Rec"]:>7.4f}  {scores["F1"]:>7.4f}  {scores["nDCG"]:>7.4f}')
 
     print(f'\n{"="*60}')
 

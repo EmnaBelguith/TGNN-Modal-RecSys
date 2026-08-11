@@ -2,7 +2,7 @@
 
 import sys
 sys.path.append("/home/infres/belguith/PFE")
-from modal_encoder import ModalEncoder, load_modal_features
+from modal_encoder_git import ModalEncoder, load_modal_features
 import torch.nn.functional as F
 
 import argparse
@@ -26,13 +26,11 @@ def config():
     parser.add_argument('-dn', '--dataset_name', type=str)
     parser.add_argument('-dp', '--dataset_path', type=str, help='raw dataset file path')
     parser.add_argument('--model_save_path', type=str, help='The model saving path')
-    parser.add_argument('--run_tag', type=str, default='', help='Suffix appended to checkpoint filename (e.g. _v2)')
-    parser.add_argument('--test_only', action='store_true', default=False,
-                        help='Skip training, load existing checkpoint and run test() directly')
     parser.add_argument('--review_feat_size', type=int, default=128)
 
+    parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--epoch', type=int, default=200)
-    parser.add_argument('--batch_size', type=int, default=None)
+    parser.add_argument('--batch_size', type=float, default=10000)
     parser.add_argument('--train_grad_clip', type=float, default=1.0)
     parser.add_argument('--train_lr', type=float, default=0.001)
     parser.add_argument('--train_min_lr', type=float, default=0.0001)
@@ -41,23 +39,12 @@ def config():
     parser.add_argument('--train_early_stopping_patience', type=int, default=10)
     parser.add_argument('--train_classification', type=bool, default=True)
 
-    parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--lambda_f', type=float, default=1e-4)
-    parser.add_argument('--lambda_l2', type=float, default=None)
-    parser.add_argument('--gcn_dropout', type=float, default=None)
+    parser.add_argument('--gcn_dropout', type=float, default=0.7)
     parser.add_argument('--num_layers', type=int, default=1)
     parser.add_argument('--ed_alpha', type=float, default=.1)
-    parser.add_argument('--model_short_name', type=str, default='RHGC4')
-    parser.add_argument('--w_deg_init', type=float, default=2.0)
-    parser.add_argument('--b_deg_init', type=float, default=-5.0)
-    parser.add_argument('--lambda_mi', type=float, default=0.01)
-    parser.add_argument('--neg_strategy', type=str, default='inbatch',
-                        choices=['random', 'multi_random', 'inbatch'])
-    parser.add_argument('--n_neg', type=int, default=5)
-    parser.add_argument('--lambda_mi_warmup', type=int, default=20)
-    parser.add_argument('--no_modal', action='store_true', default=False)
 
     args = parser.parse_args()
+    args.model_short_name = 'RHGC4'
 
     # args.dataset_name = 'Digital_Music_5'
     # args.dataset_path = '/home/d1/shuaijie/data/Digital_Music_5/Digital_Music_5.json'
@@ -65,7 +52,7 @@ def config():
     # args.gcn_dropout = 0.7
     args.device = 0
     # args.num_layers = 2
-    if args.batch_size is None: args.batch_size = 512
+    args.batch_size = 512
 
     # args.dataset_name = 'Toys_and_Games_5'
     # args.dataset_path = '/home/d1/shuaijie/data/Toys_and_Games_5/Toys_and_Games_5.json'
@@ -74,7 +61,7 @@ def config():
     # args.ed_alpha = 0.1
     # args.device = 0
     # args.num_layers = 2
-    if args.batch_size is None: args.batch_size = 512
+    args.batch_size = 512
     # args.epoch = 2000
 
     # args.dataset_name = 'Sports_and_Outdoors_5'
@@ -94,12 +81,11 @@ def config():
   # Nouveaux chemins (à ajouter)
     args.dataset_name = 'Musical_HADSF'
     args.dataset_path = '/home/infres/belguith/PFE/processed/Musical_reviews_with_aspects.jsonl'
-    if args.gcn_dropout is None: args.gcn_dropout = 0.8
-    if args.lambda_l2 is None: args.lambda_l2 = 1e-4
+    args.gcn_dropout = 0.8
     args.ed_alpha = 2.0
     args.device = 0
     args.num_layers = 2
-    if args.batch_size is None: args.batch_size = 512
+    args.batch_size = 512
 
     #     # args.dataset_name = 'Health_and_Personal_Care_5'
     #     # args.dataset_path = '/home/d1/shuaijie/data/Health_and_Personal_Care_5/Health_and_Personal_Care_5.json'
@@ -113,7 +99,7 @@ def config():
     args.device = 0
     args.dataset_name = 'Musical_HADSF'
     args.dataset_path = '/home/infres/belguith/PFE/processed/Musical_reviews_with_aspects.jsonl'
-    if args.gcn_dropout is None: args.gcn_dropout = 0.8
+    args.gcn_dropout = 0.8
     args.ed_alpha = 2.0
     # args.epoch = 800
     # args.num_layers = 2
@@ -125,19 +111,9 @@ def config():
 
     # args.device = torch.device(args.device) if args.device >= 0 else torch.device('cpu')
     args.device = f"cuda:{args.device}" if args.device >= 0 else 'cpu'
-    args.model_short_name = 'RHGC4_ranking'
 
     # configure save_fir to save all the info
-    _l2_tag  = f'_l2{args.lambda_l2}' if args.lambda_l2 > 0 else ''
-    _bs_tag  = f'_bs{args.batch_size}'
-    _mi_tag  = f'_mi{args.lambda_mi}' if args.lambda_mi > 0 else ''
-    _dp_tag  = f'_dp{args.gcn_dropout}' if args.gcn_dropout != 0.8 else ''
-    _neg_tag  = f'_{args.neg_strategy}' if args.neg_strategy != 'random' else ''
-    _nneg_tag = f'_k{args.n_neg}' if args.neg_strategy == 'multi_random' else ''
-    _warm_tag  = f'_warm{args.lambda_mi_warmup}' if args.lambda_mi_warmup > 0 else ''
-    _nmod_tag  = '_nomodal' if args.no_modal else ''
-    _run_tag   = f'_{args.run_tag}' if args.run_tag else ''
-    args.model_save_path = f'model_save/{args.dataset_name}/{args.model_short_name}_layers_{args.num_layers}_seed{args.seed}{_l2_tag}{_bs_tag}{_mi_tag}{_dp_tag}{_neg_tag}{_nneg_tag}{_warm_tag}{_nmod_tag}{_run_tag}.pt'
+    args.model_save_path = f'model_save/{args.dataset_name}/{args.model_short_name}_layers_{args.num_layers}.pt'
     if not os.path.isdir(f'model_save/{args.dataset_name}'):
         os.makedirs(f'model_save/{args.dataset_name}')
 
@@ -243,13 +219,10 @@ class MultiLayerHeteroGraphConv(nn.Module):
         self.item_embedding = nn.Parameter(torch.Tensor(item_size, msg_units))
         nn.init.xavier_uniform_(self.item_embedding.unsqueeze(0)).squeeze(0)
         self.h_modal = None  # sera injecté depuis ModalEncoder
-        self.item_degree_tensor = None  # injecté depuis l'extérieur
-        # Gate MLP : entrée = [item_collab_post_gcn (msg_units) | degree_norm (1)]
-        # Petit degré (cold) → alpha petit → plus de modal dans la late fusion.
-        self.gate_mlp = nn.Sequential(
-            nn.Linear(msg_units + 1, 64),
+        self.modal_gate = nn.Sequential(
+            nn.Linear(msg_units * 2, msg_units),
             nn.ReLU(),
-            nn.Linear(64, 1),
+            nn.Linear(msg_units, msg_units)
         )
 
         sub_conv = nn.ModuleDict()
@@ -280,12 +253,11 @@ class MultiLayerHeteroGraphConv(nn.Module):
         
 
     def forward(self, input_nodes, encoder_blocks):
-
+        
         user_outputs = []
         item_outputs = []
-        _item_collab_out = None  # collab embedding (raw) sauvé pour le gate post-GNN
-        _item_modal_out  = None  # h_modal sauvé pour le blend post-GNN
 
+        # first layer
         for l in range(len(self.conv_layers)):
             u_layer_output = dict()
             m_layer_output = dict()
@@ -295,15 +267,16 @@ class MultiLayerHeteroGraphConv(nn.Module):
 
             for rating in self.rating_values:
 
-                if l == 0:
-                    i_o = conv_layer[rating](block['user', rating, 'item'],
+                if l == 0: 
+                    i_o = conv_layer[rating](block['user', rating, 'item'], 
                                              self.user_embedding[input_nodes['user']])
                     item_collab = self.item_embedding[input_nodes['item']]
-                    if _item_collab_out is None:  # sauver une fois pour le placeholder eval
-                        _item_collab_out = item_collab
-                    # GNN voit uniquement le signal collaboratif (pure late fusion)
-                    u_o = conv_layer[f'rev-{rating}'](block['item', f'rev-{rating}', 'user'],
-                                                      item_collab)
+                    item_modal  = self.h_modal[input_nodes['item']]
+                    gate_input  = torch.cat([item_collab, item_modal], dim=-1)
+                    alpha = torch.sigmoid(self.modal_gate(gate_input))
+                    item_init   = alpha * item_collab + (1 - alpha) * item_modal
+                    u_o = conv_layer[f'rev-{rating}'](block['item', f'rev-{rating}', 'user'], 
+                                                      item_init)
                 else:
                     _u_feats = user_outputs[-1][rating]
                     _i_feats = item_outputs[-1][rating]
@@ -319,50 +292,11 @@ class MultiLayerHeteroGraphConv(nn.Module):
 
         user_outputs = sum(list(user_outputs[-1].values()))
         item_outputs = sum(list(item_outputs[-1].values()))
-
-        # Fix : _degree_norm_out et _item_modal_out depuis les seed items uniquement.
-        # input_nodes['item'] contient tout le k-hop voisinage (>> seed items), ce qui
-        # causait un mismatch de taille dans le torch.cat suivant.
-        _seed_gids       = encoder_blocks[-1].dstdata['_ID']['item']
-        _degrees_out     = self.item_degree_tensor[_seed_gids]
-        _degree_norm_out = (_degrees_out / self.item_degree_tensor.max().clamp(min=1.0)).unsqueeze(-1)
-        _item_modal_out  = self.h_modal[_seed_gids]
-
+        # user_outputs = user_outputs.sum(1)
         user_outputs = self.agg_act(user_outputs)
         user_outputs = self.dropout(user_outputs)
         user_outputs = self.ufc(user_outputs)
-
-        # Late fusion : alpha appris depuis [post-GCN collab | degree_norm].
-        # Petit degré (cold) → alpha petit → plus de modal.
-        # Grand degré (warm) → alpha grand → plus de collab.
-        _gate_input = torch.cat([item_outputs, _degree_norm_out], dim=-1)  # (n, 129)
-        alpha = torch.sigmoid(self.gate_mlp(_gate_input))  # (n, 1)
-        if self.training:
-            self._last_alpha = alpha.squeeze(-1).detach()
-            self._gate_step = getattr(self, '_gate_step', 0) + 1
-            if self._gate_step % 100 == 1:
-                _cold_mask = (_degrees_out >= 5) & (_degrees_out <= 10)
-                _warm_mask = _degrees_out > 20
-                if _cold_mask.any() and _warm_mask.any():
-                    _a = alpha.squeeze(-1).detach()
-                    _ac = _a[_cold_mask].mean().item()
-                    _aw = _a[_warm_mask].mean().item()
-                    _status = 'OK cold<warm' if _ac < _aw else 'WARN: cold>=warm'
-                    print(
-                        f"[GATE_BATCH] step={self._gate_step}"
-                        f"  alpha cold={_ac:.3f}  warm={_aw:.3f}"
-                        f"  [{_status}]"
-                        f"  n_cold={_cold_mask.sum().item()} n_warm={_warm_mask.sum().item()}",
-                        flush=True
-                    )
-        if not self.training:
-            _iids_cpu = _item_collab_out.new_zeros(0).long()  # placeholder
-            _modal_contrib  = ((1 - alpha) * _item_modal_out).norm(dim=-1).detach().cpu()
-            _collab_contrib = (alpha * item_outputs).norm(dim=-1).detach().cpu()
-            _ratio_modal    = _modal_contrib / (_modal_contrib + _collab_contrib + 1e-8)
-            if not hasattr(self, '_alpha_buffer'): self._alpha_buffer = []
-            self._alpha_buffer.extend(_ratio_modal.tolist())
-        item_outputs = alpha * item_outputs + (1 - alpha) * _item_modal_out
+        # item_outputs = item_outputs.sum(1)
         item_outputs = self.agg_act(item_outputs)
         item_outputs = self.dropout(item_outputs)
         item_outputs = self.ifc(item_outputs)
@@ -552,7 +486,8 @@ class SentenceRetrival(nn.Module):
             nn.ReLU(),
             nn.Linear(in_units, in_units, bias=False),
         )
-        self.item_scorer = nn.Linear(in_units, 1, bias=False)
+        self.rating_predictor = nn.Linear(in_units, num_classes, bias=False)
+        self.contrast_loss = ContrastLoss(in_units, 128)
 
     def get_review_feature(self, sid):
         # sid: bs * k
@@ -561,69 +496,57 @@ class SentenceRetrival(nn.Module):
         review_feat = review_feat / length
         return review_feat
 
-    def calc_sentence_ranking(self, edges):
+    def calc_ranking_loss(self, edges):
+
+        # rating
         rh = self.rating_linear(torch.cat([edges.src['rf'], edges.dst['rf']], dim=1))
+        # review_feat = self.review_embedding(edges.data['review_id'])
+        pr = self.rating_predictor(rh)
+        # mi_score = self.contrast_loss(rh, review_feat)
+
+        # topic
         th = self.topic_linear(torch.cat([edges.src['tf'], edges.dst['tf']], dim=1))
         th = th + rh
         pos_sid = edges.data['sentence_id']
-        pos_review = self.get_review_feature(pos_sid)
-        pos_score = (th * pos_review).sum(1)
-        n_neg = getattr(self, '_n_neg', 1)
-        losses = []
-        for _ in range(n_neg):
-            neg_sid = torch.randint(1, self.sentence_embedding.weight.shape[0],
-                                    pos_sid.shape, device=pos_sid.device)
-            neg_review = self.get_review_feature(neg_sid)
-            neg_score = (th * neg_review).sum(1)
-            losses.append(-(pos_score - neg_score).sigmoid().log())
-        loss = torch.stack(losses, dim=0).mean(0)
-        return {'mi_score': loss, 'ranking_loss': loss}
+        neg_sid = torch.randint(1, self.sentence_embedding.weight.shape[0], \
+                                pos_sid.shape, 
+                                device=pos_sid.device)
 
-    def predict_score(self, graph, urf, irf):
+        pos_review = self.get_review_feature(pos_sid)
+        neg_review = self.get_review_feature(neg_sid)
+
+        pos_score = (th * pos_review).sum(1)
+        neg_score = (th * neg_review).sum(1)
+        loss = - (pos_score - neg_score).sigmoid().log()
+
+        # return {'p_ratings': pr, 'mi_score': mi_score, 'ranking_loss': loss}
+        return {'p_ratings': pr, 'mi_score': loss, 'ranking_loss': loss}
+
+    def predict_rating(self, graph, urf, irf, utf, itf):
+        # graph.nodes['item'].data['th'] = itf
+        # graph.nodes['user'].data['th'] = utf
         graph.nodes['item'].data['rf'] = irf
         graph.nodes['user'].data['rf'] = urf
 
-        def _score_func(e):
-            h = self.rating_linear(torch.cat([e.src['rf'], e.dst['rf']], dim=1))
-            return {'s': self.item_scorer(h)}
+        _rating_predic_func = lambda e: {'p': self.rating_predictor(
+            self.rating_linear(torch.cat([e.src['rf'], e.dst['rf']], dim=1))
+        )}
 
         with graph.local_scope():
-            graph.apply_edges(_score_func)
-            return graph.edata['s'].squeeze(-1)
+            graph.apply_edges(_rating_predic_func)
+            pr = graph.edata['p']
+        return pr
         
-    def forward(self, graph, urf, irf, utf, itf, neg_strategy='random', n_neg=1):
+    def forward(self, graph, urf, irf, utf, itf):
         graph.nodes['user'].data['rf'] = urf
         graph.nodes['item'].data['rf'] = irf
         graph.nodes['user'].data['tf'] = utf
         graph.nodes['item'].data['tf'] = itf
 
         with graph.local_scope():
-            if neg_strategy == 'inbatch':
-                def _store(edges):
-                    rh = self.rating_linear(torch.cat([edges.src['rf'], edges.dst['rf']], dim=1))
-                    th_val = self.topic_linear(torch.cat([edges.src['tf'], edges.dst['tf']], dim=1))
-                    return {'_th': th_val + rh, '_pids': edges.data['sentence_id']}
-                graph.apply_edges(_store)
-                th = graph.edata['_th']
-                pos_sid = graph.edata['_pids']
-                pos_review = self.get_review_feature(pos_sid)
-                pos_score = (th * pos_review).sum(1)
-                N = th.shape[0]
-                score_mat = th @ pos_review.T
-                diag = torch.eye(N, dtype=torch.bool, device=th.device)
-                score_mat = score_mat.masked_fill(diag, float('-inf'))
-                pos_exp = pos_score.unsqueeze(1).expand(N, N)
-                bpr = -(pos_exp - score_mat).sigmoid().log()
-                bpr = bpr.masked_fill(diag, 0.0)
-                loss = bpr.sum(1) / (N - 1)
-                mi = loss.mean()
-                return mi, mi
-            else:
-                self._n_neg = n_neg if neg_strategy == 'multi_random' else 1
-                graph.apply_edges(self.calc_sentence_ranking)
-                mi_score = graph.edata['mi_score']
-                ranking_loss = graph.edata['ranking_loss']
-        return mi_score.mean(), ranking_loss.mean()
+            graph.apply_edges(self.calc_ranking_loss)
+            pr, mi_score, ranking_loss = graph.edata['p_ratings'], graph.edata['mi_score'], graph.edata['ranking_loss']
+        return pr, mi_score.mean(), ranking_loss.mean()
 
     def measure_sim(self, interaction_feat, sid_list):
         # bs * dim, bs * k
@@ -747,9 +670,6 @@ class Net(nn.Module):
 
         self.sentence_embedding = sentence_embedding# nn.Embedding.from_pretrained(sentence_embedding)
         self.review_embedding = nn.Embedding.from_pretrained(review_embedding)
-        self.lambda_l2 = params.lambda_l2
-        self.neg_strategy = params.neg_strategy
-        self.n_neg = params.n_neg
         self.rating_encoder = MultiLayerHeteroGraphConv(params.rating_values, \
                                                         self.review_embedding, \
                                                         params.user_size, \
@@ -760,8 +680,12 @@ class Net(nn.Module):
 
         self.topic_encoder = TopicGraphEncoder(self.sentence_embedding, params.global_topic_size, params.gcn_out_units)
         self.topic_decoder = SentenceRetrival(params.gcn_out_units, 5, self.review_embedding, self.sentence_embedding)
+        
+        self.register_buffer('rating_values', torch.FloatTensor(params.rating_values).view(1, -1))
 
         reset_parameters(self)
+
+        self.rating_loss_net = nn.CrossEntropyLoss()
 
     def state_dict(self):
         # exclude review embedding
@@ -774,109 +698,89 @@ class Net(nn.Module):
             sd.pop(k)
         return sd
 
-    def predict_score(self, input_nodes, encoder_blocks, decoder_graph):
+    def predict_rating(self, input_nodes, encoder_blocks, decoder_graph):
         user_feat, item_feat = self.rating_encoder(input_nodes, encoder_blocks)
-        return self.topic_decoder.predict_score(decoder_graph, user_feat, item_feat)
+        predicts = self.topic_decoder.predict_rating(decoder_graph, user_feat, item_feat, None, None)
+        predicts = self.predicts_to_ratings(predicts)
+        return predicts
 
-    def calc_loss(self,
-                  rating_input_nodes,
-                  rating_encoder_blocks,
-                  topic_input_nodes,
-                  topic_encoder_blocks,
-                  pos_graph,
-                  sample_weight=None):
+    def calc_loss(self, \
+                  rating_input_nodes, \
+                  rating_encoder_blocks, \
+                  topic_input_nodes, \
+                  topic_encoder_blocks, \
+                  decoder_graph):
         self.train()
 
         urf, irf = self.rating_encoder(rating_input_nodes, rating_encoder_blocks)
         utf, itf = self.topic_encoder(topic_input_nodes, topic_encoder_blocks)
 
-        # Sentence ranking loss (topic-based, unchanged)
-        ed_mi, ranking_loss = self.topic_decoder(pos_graph,
-                                                 urf, irf,
-                                                 utf + urf, itf + irf,
-                                                 neg_strategy=self.neg_strategy,
-                                                 n_neg=self.n_neg)
+        predicts, ed_mi, ranking_loss = self.topic_decoder(decoder_graph, \
+                                                           urf, irf, \
+                                                           # utf, itf)
+                                                           utf + urf, itf + irf)
 
-        # BPR avec in-batch negatives :
-        # pour chaque paire (u_i, pos_i), le négatif est pos_{perm(i)} (item d'une autre paire du batch)
-        src_pos, dst_pos = pos_graph.edges()
-        u_emb     = urf[src_pos]
-        i_pos_emb = irf[dst_pos]
+        rating_loss = self.rating_loss_net(predicts, decoder_graph.edata['label'])
 
-        N = i_pos_emb.shape[0]
-        perm = torch.randperm(N, device=i_pos_emb.device)
-        clash = perm == torch.arange(N, device=i_pos_emb.device)
-        if clash.any():
-            perm[clash] = (perm[clash] + 1) % N
-        i_neg_emb = i_pos_emb[perm]
+        return rating_loss, ed_mi, ranking_loss, urf, irf
 
-        h_pos = self.topic_decoder.rating_linear(torch.cat([u_emb, i_pos_emb], dim=1))
-        h_neg = self.topic_decoder.rating_linear(torch.cat([u_emb, i_neg_emb], dim=1))
-        score_pos = self.topic_decoder.item_scorer(h_pos).squeeze(-1)
-        score_neg = self.topic_decoder.item_scorer(h_neg).squeeze(-1)
+    @torch.no_grad()
+    def evaluate_rating(self, dataloader, etype='valid'):
+        device = self.review_embedding.weight.device
+        rmse_list = []
+        mae_list = []  # List to store MAE values
+        # 用于保存每个评分组（1,2,3,4,5）的误差平方列表
+        group_errors = defaultdict(list)
 
-        ratings = pos_graph.edata['rating'].float()
-        weight  = ratings / 5.0
-        if sample_weight is not None:
-            weight = weight * sample_weight
-            weight = weight / (weight.mean() + 1e-9)
-        bpr_loss = -(weight * F.logsigmoid(score_pos - score_neg)).mean()
-        l2_reg = self.lambda_l2 * (
-            self.rating_encoder.user_embedding.norm(2).pow(2) +
-            self.rating_encoder.item_embedding.norm(2).pow(2)
-        ) / u_emb.shape[0]
-        bpr_loss = bpr_loss + l2_reg
+        self.eval()
+        for input_nodes, edge_subgraph, blocks in dataloader:
+            input_nodes = {k: v.to(device) for k, v in input_nodes.items()}
+            edge_subgraph = edge_subgraph[etype].to(device)
+            blocks = [b.to(device) for b in blocks]
 
-        # BPR diagnostic — premiers batches + tous les 100 steps
-        self._bpr_step = getattr(self, '_bpr_step', 0) + 1
-        if self._bpr_step <= 10 or self._bpr_step % 100 == 0:
-            with torch.no_grad():
-                diff = score_pos.detach() - score_neg.detach()
-                _neg_global = pos_graph.nodes['item'].data['_ID'][dst_pos[perm]]
-                _neg_deg    = self.rating_encoder.item_degree_tensor[_neg_global].float()
-                _rat_dist   = ratings.long().bincount(minlength=6)[1:].tolist()
-                print(
-                    f"[BPR_DEBUG] step={self._bpr_step}"
-                    f" | diff mean={diff.mean():.4f} std={diff.std():.4f}"
-                    f" | pos={score_pos.detach().mean():.4f} neg={score_neg.detach().mean():.4f}"
-                    f" | weight mean={weight.mean():.3f} min={weight.min():.3f} max={weight.max():.3f}"
-                    f" | neg_deg mean={_neg_deg.mean():.1f} min={_neg_deg.min():.0f} max={_neg_deg.max():.0f}"
-                    f" | rating_dist(1..5)={_rat_dist}",
-                    flush=True
-                )
+            p_ratings = self.predict_rating(input_nodes, blocks, edge_subgraph)
+            true_ratings = edge_subgraph.edata['rating']
 
-        return bpr_loss, ed_mi, ranking_loss, urf, irf
+            # 遍历每个样本，将误差平方按照真实评分分组
+            for pred, true in zip(p_ratings.cpu().tolist(), true_ratings.cpu().tolist()):
+                error_sq = (pred - true) ** 2
+                group = int(true)  # 假设真实评分为 1,2,3,4,5
+                group_errors[group].append(error_sq)
+            
+            rmse = p_ratings - edge_subgraph.edata['rating']
+            mae = torch.abs(rmse)  # Absolute error for MAE
 
-    def _get_item_emb_global(self, global_iids):
-        """Représentation approchée pour items hors-batch (sans propagation GNN).
-        Cohérent avec la late fusion de forward() : collab embedding comme proxy GNN output.
-        """
-        collab   = self.rating_encoder.item_embedding[global_iids]
-        modal    = self.rating_encoder.h_modal[global_iids]
-        deg      = self.rating_encoder.item_degree_tensor[global_iids]
-        deg_max  = self.rating_encoder.item_degree_tensor.max().clamp(min=1.0)
-        deg_norm = (deg / deg_max).unsqueeze(-1)
-        gate_in  = torch.cat([collab, deg_norm], dim=-1)
-        alpha    = torch.sigmoid(self.rating_encoder.gate_mlp(gate_in))
-        emb      = alpha * collab + (1 - alpha) * modal
-        return self.rating_encoder.ifc(self.rating_encoder.agg_act(emb))
+            rmse_list.extend(rmse.cpu().tolist())
+            mae_list.extend(mae.cpu().tolist())
 
+        # 对每个评分组计算均值（即 MSE）
+        group_mse = {group: np.mean(errors) for group, errors in group_errors.items()}
+        # 输出各评分组的 MSE
+        print("各评分组（1～5）的均方误差（MSE）：")
+        for group in sorted(group_mse.keys()):
+            print("评分 {}: MSE = {:.4f}".format(group, group_mse[group]))
+
+        rmse_value = np.sqrt(np.power(np.array(rmse_list), 2).mean())
+        mae_value = np.array(mae_list).mean()  # Calculate mean of absolute errors
+        mse_value = np.power(np.array(rmse_list), 2).mean()
+        return rmse_value, mae_value, mse_value
+    
     @torch.no_grad()
     def evaluate_sentence_ranking(self, dataloader, raw_graph, sampler, etype='valid', topk=5):
         device = self.review_embedding.weight.device
         # group_scores 用于保存每个评分组下的各指标列表
         group_scores = defaultdict(lambda: defaultdict(list))
         scores_list = []
-        for rating_input_nodes, pos_graph, _neg_graph, rating_encoder_blocks in dataloader:
-            decoder_graph = pos_graph[etype].to(device)
-            input_nodes, _, blocks = sampler.sample(raw_graph,
-                                                    {'user': decoder_graph.nodes['user'].data['_ID'].cpu(),
-                                                     'item': decoder_graph.nodes['item'].data['_ID'].cpu()})
+        for rating_input_nodes, decoder_graph, rating_encoder_blocks in dataloader:
+            input_nodes, _, blocks = sampler.sample(raw_graph, \
+                                                    {'user': decoder_graph.nodes['user'].data['_ID'], \
+                                                     'item': decoder_graph.nodes['item'].data['_ID']})
 
             rating_input_nodes = {k: v.to(device) for k, v in rating_input_nodes.items()}
             input_nodes = {k: v.to(device) for k, v in input_nodes.items()}
             blocks = [b.to(device) for b in blocks]
             rating_encoder_blocks = [b.to(device) for b in rating_encoder_blocks]
+            decoder_graph = decoder_graph[etype].to(device)
 
             # 获取每个样本的真实评分（假设取值为 1～5）
             ratings = decoder_graph.edata['rating'].cpu().tolist()
@@ -914,123 +818,23 @@ class Net(nn.Module):
         return scores_list
 
 
-    @torch.no_grad()
-    def evaluate_ranking_ndcg(self, dataloader, dataset, K=10,
-                               relevance_threshold=1, etype='valid',
-                               n_neg=99, seed=42):
-        """
-        Protocole standard RecSys : 1 pos + n_neg négatifs par user.
-        Négatifs = items jamais vus (ni train ni etype) tirés aléatoirement.
-        Identique à evaluate_item_ranking dans evaluate_model_run.py.
-        """
-        import math
-        device = self.review_embedding.weight.device
-        self.eval()
-        rng = np.random.default_rng(seed)
+    def predicts_to_ratings(self, predicts):
+        if len(predicts) < 2:
+            return predicts
+        else:
+            return (torch.softmax(predicts, dim=1) * self.rating_values).sum(dim=1)
+        
 
-        # 1. train_seen par user
-        graph = dataset.graph
-        train_u, train_i = graph['train'].edges()
-        train_seen = defaultdict(set)
-        for u, i in zip(train_u.tolist(), train_i.tolist()):
-            train_seen[u].add(i)
-
-        # 2. Collecter embeddings user/item et items positifs depuis le dataloader
-        user_emb  = {}
-        item_emb  = {}
-        pos_items = defaultdict(dict)  # uid → {iid: rating}
-
-        for input_nodes, pos_graph, _neg_graph, blocks in dataloader:
-            input_nodes_dev = {k: v.to(device) for k, v in input_nodes.items()}
-            pg              = pos_graph[etype].to(device)
-            blocks_dev      = [b.to(device) for b in blocks]
-
-            urf, irf = self.rating_encoder(input_nodes_dev, blocks_dev)
-
-            g_uids = pg.nodes['user'].data['_ID'].cpu().tolist()
-            g_iids = pg.nodes['item'].data['_ID'].cpu().tolist()
-            for local_u, global_u in enumerate(g_uids):
-                if global_u not in user_emb:
-                    user_emb[global_u] = urf[local_u].cpu()
-            for local_i, global_i in enumerate(g_iids):
-                if global_i not in item_emb:
-                    item_emb[global_i] = irf[local_i].cpu()
-
-            src_idx, dst_idx = pg.edges()
-            uids    = pg.srcdata['_ID'][src_idx].cpu().tolist()
-            iids    = pg.dstdata['_ID'][dst_idx].cpu().tolist()
-            ratings = pg.edata['rating'].cpu().tolist()
-            for uid, iid, r in zip(uids, iids, ratings):
-                pos_items[uid][iid] = r
-
-        # 3. Scorer (N, dim) paires sur CPU pour éviter les transfers répétés
-        rating_linear = self.topic_decoder.rating_linear.to('cpu')
-        item_scorer   = self.topic_decoder.item_scorer.to('cpu')
-
-        def score_pairs(u_emb_t, i_embs_t):
-            u_rep = u_emb_t.unsqueeze(0).expand(i_embs_t.shape[0], -1)
-            return item_scorer(rating_linear(torch.cat([u_rep, i_embs_t], dim=1))).squeeze(-1)
-
-        # 4. Pool de candidats = tous les items dont on a l'embedding
-        known_items = np.array(sorted(item_emb.keys()))
-
-        # 5. nDCG@K avec 1 pos + n_neg négatifs
-        ndcg_list = []
-        for uid, items in pos_items.items():
-            if uid not in user_emb:
-                continue
-            relevant = {iid for iid, r in items.items() if r >= relevance_threshold}
-            if not relevant or not all(iid in item_emb for iid in relevant):
-                continue
-
-            excluded   = train_seen[uid] | set(items.keys())
-            candidates = np.setdiff1d(known_items, list(excluded), assume_unique=True)
-            if len(candidates) == 0:
-                continue
-
-            neg_ids    = rng.choice(candidates, size=min(n_neg, len(candidates)), replace=False).tolist()
-            all_ids    = list(relevant) + neg_ids
-            all_embs   = torch.stack([item_emb[i] for i in all_ids])
-            all_scores = score_pairs(user_emb[uid], all_embs).tolist()
-
-            ranked_ids = [iid for iid, _ in sorted(zip(all_ids, all_scores), key=lambda x: x[1], reverse=True)]
-            ideal_n    = len(relevant)
-            dcg        = sum(1.0 / math.log2(i + 2) for i, iid in enumerate(ranked_ids[:K]) if iid in relevant)
-            idcg       = sum(1.0 / math.log2(i + 2) for i in range(min(ideal_n, K)))
-            ndcg_list.append(dcg / idcg if idcg > 0 else 0.0)
-
-        # Remettre les modules sur GPU
-        self.topic_decoder.rating_linear.to(device)
-        self.topic_decoder.item_scorer.to(device)
-
-        return float(np.mean(ndcg_list)) if ndcg_list else 0.0
-
-    def compute_fusion_loss(self, user_emb, h_modal_pos, h_modal_neg, lambda_f=1e-4):
-        """
-        Fusion Loss (CFMM Eq.6 adapté).
-        Supervise h_modal avec les préférences users directement.
-        user_emb    : (n, 128) — représentations users (urf) pour interactions positives
-        h_modal_pos : (n, 128) — h_modal des items vus (tous ratings)
-        h_modal_neg : (n, 128) — h_modal des items vus par d'autres users (in-batch permutation)
-        """
-        pos_score = (user_emb * h_modal_pos).sum(dim=-1)
-        neg_score = (user_emb * h_modal_neg).sum(dim=-1)
-        loss = -F.logsigmoid(pos_score - neg_score).mean()
-        return lambda_f * loss
-
-
+def set_seed(seed):
     import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    print(f"[SEED] seed={seed}", flush=True)
 
 def train(params):
-    import random
-    random.seed(params.seed)
-    np.random.seed(params.seed)
-    torch.manual_seed(params.seed)
-    torch.cuda.manual_seed_all(params.seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    torch.use_deterministic_algorithms(True, warn_only=True)
-    print(f"[SEED] {params.seed}", flush=True)
+    set_seed(getattr(params, "seed", 42))
 
     # global logger
 
@@ -1092,14 +896,14 @@ def train(params):
     graph = dataset.graph
     topic_sampler = dataset.get_topic_sentence_sampler()
 
-    best_valid_ndcg = 0.0
-    best_test_ndcg  = 0.0
+    best_valid_rmse = np.inf
+    best_test_rmse = np.inf
+    best_test_mae = np.inf
+    best_test_mse = np.inf
 
     no_better_valid = 0
     best_iter = -1
-
-    repr_norm_history = []  # (epoch, urf_norm, irf_norm, ratio)
-
+    
     # logger.info('Valid -' + format_dict_to_str(net.evaluate_sentence_ranking(valid_dataloader, graph, topic_sampler, etype='valid')))
     h_modal, h_v, h_t = modal_enc()
     
@@ -1113,41 +917,11 @@ def train(params):
        print(f"[Modal] h_v={h_v.norm(dim=-1).mean():.4f} | h_t={h_t.norm(dim=-1).mean():.4f}") 
     net.rating_encoder.h_modal = h_modal
     with torch.no_grad():
-        _n_items = net.rating_encoder.item_embedding.shape[0]
-        _modal_avg_norm = h_modal[:_n_items].norm(dim=-1).mean()
-        _rand_emb = torch.randn(_n_items, params.gcn_out_units, device=params.device)
-        _rand_emb = F.normalize(_rand_emb, dim=-1) * _modal_avg_norm
-        net.rating_encoder.item_embedding.data.copy_(_rand_emb)
-    print(f"[INIT] item_embedding aléatoire à norme={_modal_avg_norm:.3f} (même échelle que h_modal)")
-    import pandas as pd
-    _df_deg_train = pd.read_csv('/home/infres/belguith/PFE/processed/Musical_interactions_reviews.csv')
-    _deg_train = _df_deg_train['iid'].value_counts()
-    _n_init = net.rating_encoder.item_embedding.shape[0]
-    _deg_tensor_train = torch.zeros(_n_init, dtype=torch.float32)
-    for _iid, _cnt in _deg_train.items():
-        if int(_iid) < _n_init:
-            _deg_tensor_train[int(_iid)] = float(_cnt)
-    net.rating_encoder.item_degree_tensor = _deg_tensor_train.to(params.device)
-    print("[INIT] item_degree_tensor injecté avec vrais degrés", flush=True)
-
-    # Précalcul des indices cold/warm pour les diagnostics
-    _diag_deg = _deg_tensor_train  # CPU
-    _diag_cold_idx = torch.where((_diag_deg >= 5) & (_diag_deg <= 10))[0]
-    _diag_warm_idx  = torch.where(_diag_deg > 20)[0]
-    print(f"[DIAG_SETUP] cold_items={len(_diag_cold_idx)}, warm_items={len(_diag_warm_idx)}", flush=True)
-
+        net.rating_encoder.item_embedding.data.copy_(h_modal[:net.rating_encoder.item_embedding.shape[0]])
+    print("[INIT] item_embedding initialisé depuis h_modal", flush=True)
     logger.info('Test - '+ format_dict_to_str(net.evaluate_sentence_ranking(test_dataloader, graph, topic_sampler, etype='test')))
 
     logger.info("Start training ...")
-
-    # Normes à l'initialisation (epoch 0, avant tout entraînement)
-    with torch.no_grad():
-        _u0 = net.rating_encoder.user_embedding.norm(dim=-1).mean().item()
-        _i0 = net.rating_encoder.item_embedding.norm(dim=-1).mean().item()
-        _r0 = _u0 / (_i0 + 1e-9)
-        repr_norm_history.append((0, _u0, _i0, _r0))
-        print(f"[REPR_NORM] epoch=  0  user={_u0:.4f}  item={_i0:.4f}  ratio_u/i={_r0:.4f}  (INIT - avant training)", flush=True)
-
     for iter_idx in range(1, params.epoch):
         net.train()
 
@@ -1155,63 +929,50 @@ def train(params):
         # pbar = train_dataloader
         train_rmse = []
         train_mi = []
-        for rating_input_nodes, pos_graph, _neg_graph, rating_blocks in pbar:
-            topic_input_nodes, _, topic_blocks = topic_sampler.sample(graph,
-                                                                      {'user': pos_graph.nodes['user'].data['_ID'],
-                                                                       'item': pos_graph.nodes['item'].data['_ID']})
+        for rating_input_nodes, edge_subgraph, rating_blocks in pbar:
+            # input_nodes: 表示计算 edge_subgraph 所需要的节点，
+            # edge_subgraph: sample 出来的 graph 
+            # rating_blocks:包含了每个GNN层要计算哪些节点表示作为输出，要将哪些节点表示作为输入，以及来自输入节点的表示如何传播到输出节点。
+            
+            # decoder_graph.nodes['item'].data['_ID']
+            topic_input_nodes, _, topic_blocks = topic_sampler.sample(graph, \
+                                                                      {'user': edge_subgraph.nodes['user'].data['_ID'], \
+                                                                       'item': edge_subgraph.nodes['item'].data['_ID']})
 
             rating_input_nodes = {k: v.to(params.device) for k, v in rating_input_nodes.items()}
-            topic_input_nodes  = {k: v.to(params.device) for k, v in topic_input_nodes.items()}
-            pos_graph_train    = pos_graph['train'].to(params.device)
-            rating_blocks      = [b.to(params.device) for b in rating_blocks]
-            topic_blocks       = [b.to(params.device) for b in topic_blocks]
+            topic_input_nodes = {k: v.to(params.device) for k, v in topic_input_nodes.items()}
+            edge_subgraph = edge_subgraph['train'].to(params.device)
+            rating_blocks = [b.to(params.device) for b in rating_blocks]
+            topic_blocks = [b.to(params.device) for b in topic_blocks]
 
-            if params.no_modal:
-                h_modal = torch.zeros(net.rating_encoder.item_embedding.weight.shape[0],
-                                      params.gcn_out_units, device=params.device)
-                h_v = h_t = h_modal
-            else:
-                h_modal, h_v, h_t = modal_enc()
+            h_modal, h_v, h_t = modal_enc() 
             net.rating_encoder.h_modal = h_modal
 
             r_loss, mi_score, ranking_loss, urf, irf = net.calc_loss(
                 rating_input_nodes, rating_blocks,
                 topic_input_nodes, topic_blocks,
-                pos_graph_train,
+                edge_subgraph
             )
 
-            batch_items = pos_graph_train.nodes['item'].data['_ID']
-            modal_loss  = torch.tensor(0.0, device=params.device) if params.no_modal else \
-                          modal_enc.calculate_loss_infonce(h_v, h_t, batch_items)
+            batch_items = edge_subgraph.nodes['item'].data['_ID']
+            modal_loss = modal_enc.calculate_loss_infonce(h_v, h_t, batch_items)
 
-            # Fusion Loss — BPR sur embeddings modaux, négatifs in-batch (items vus par d'autres users)
-            _src_idx_f, _dst_idx_f = pos_graph_train.edges()
-            _item_gids_f      = pos_graph_train.dstdata['_ID'][_dst_idx_f]
-            _u_emb_per_edge   = urf[_src_idx_f]
-            _h_modal_per_edge = h_modal[_item_gids_f]
-            f_loss = torch.tensor(0.0, device=params.device)
-            _n_f = _h_modal_per_edge.shape[0]
-            if not params.no_modal and _n_f > 1:
-                _perm_f = torch.randperm(_n_f, device=params.device)
-                _clash  = _perm_f == torch.arange(_n_f, device=params.device)
-                if _clash.any():
-                    _perm_f[_clash] = (_perm_f[_clash] + 1) % _n_f
-                f_loss = net.compute_fusion_loss(
-                    _u_emb_per_edge,
-                    _h_modal_per_edge,
-                    _h_modal_per_edge[_perm_f],
-                    lambda_f=params.lambda_f
-                )
 
-            _eff_lambda_mi = params.lambda_mi if iter_idx > params.lambda_mi_warmup else 0.0
-            mi_term = _eff_lambda_mi * mi_score if _eff_lambda_mi > 0 else torch.tensor(0.0, device=params.device)
-            loss = r_loss + 0.1 * modal_loss + f_loss + mi_term
+            loss = r_loss + 0.1 * modal_loss
             optimizer.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(net.parameters(), params.train_grad_clip)
+            # check grad modal_enc
+            for name, param in modal_enc.named_parameters():
+                if param.grad is not None:
+                    print(f"[GRAD] {name}: {param.grad.abs().mean():.6f}")
+                    break
+            else:
+                print("[GRAD] modal_enc: aucun gradient ← h_modal ne contribue pas!")
             optimizer.step()
 
-            pbar.set_description(f"train_loss={r_loss:.4f}, MI={mi_score:.2f}, mi_term={mi_term.item():.4f}, modal={modal_loss.item():.4f}, f_loss={f_loss.item():.6f}")
+            # print(f"ranking:{ranking_loss.item():.4f}")
+            pbar.set_description(f"train_loss={r_loss:.4f}, MI={mi_score:.2f}, ranking={ranking_loss.item():.4f}, modal={modal_loss.item():.4f}")
             
             # with torch.no_grad():
             #     predict_ratings = net.predicts_to_ratings(predicts)
@@ -1233,97 +994,37 @@ def train(params):
             # DIAG variance + normes + comparaison
             _collab_norm = _e.norm(dim=-1).mean()
             _modal_norm  = _h.norm(dim=-1).mean()
-            _user_emb_norm = net.rating_encoder.user_embedding.norm(dim=-1).mean().item()
-            print(f"[EMB_NORM] epoch={iter_idx:>3d}  user={_user_emb_norm:.4f}  item={_collab_norm.item():.4f}", flush=True)
             print(f"[DIAG] h_modal std_per_dim={_h.std(dim=0).mean():.4f} std_per_item={_h.std(dim=1).mean():.4f} norm={_modal_norm:.3f} | collab norm={_collab_norm:.3f}", flush=True)
             # DIAG cosine similarity
             _sim = torch.nn.functional.cosine_similarity(_h[:_n], _e).mean()
             print(f"[DIAG] cosine sim h_modal/collab = {_sim:.4f}", flush=True)
-            # GATE monitor — alpha appris depuis [collab | degree_norm]
-            _deg_all  = net.rating_encoder.item_degree_tensor[:_n]
-            _deg_max  = net.rating_encoder.item_degree_tensor.max().clamp(min=1.0)
-            _deg_norm = (_deg_all / _deg_max).unsqueeze(-1).to(_e.device)
-            _gate_in  = torch.cat([_e, _deg_norm], dim=-1)
-            _alpha = torch.sigmoid(net.rating_encoder.gate_mlp(_gate_in)).detach()  # (n, 1)
-            print(f"[GATE] epoch={iter_idx} mean={_alpha.mean():.3f} std={_alpha.std():.3f} min={_alpha.min():.3f} max={_alpha.max():.3f}", flush=True)
-            _corr = torch.corrcoef(torch.stack([_alpha.squeeze(-1), _deg_all.to(_e.device)]))[0,1].item()
-            print(f"[GATE_CORR] alpha vs degree={_corr:.4f} (>0 = warm→plus collab, attendu)", flush=True)
+            # GATE monitor
+            _gate_input = torch.cat([_e, _h[:_n]], dim=-1)
+            _alpha = torch.sigmoid(net.rating_encoder.modal_gate(_gate_input))
+            _std_items = _alpha.std(dim=0).mean()
+            _std_dims  = _alpha.std(dim=1).mean()
+            print(f"[GATE] epoch={iter_idx} mean={_alpha.mean():.3f} std_global={_alpha.std():.3f} std_inter_items={_std_items:.3f} std_inter_dims={_std_dims:.3f} min={_alpha.min():.3f} max={_alpha.max():.3f}", flush=True)
 
-            # DIAG 1 : est-ce que img/txt convergent vers 0 ou 1 ?
-            _w = torch.softmax(torch.cat([
-                net.rating_encoder.h_modal.new_zeros(1),  # placeholder
-            ], dim=-1), dim=-1) if False else None
-            # On utilise h_modal et h_v/h_t depuis modal_enc
-            with torch.no_grad():
-                _hv = modal_enc.norm_v(torch.nn.functional.relu(modal_enc.image_trs(modal_enc.image_embedding.weight))) if hasattr(modal_enc, 'norm_v') else modal_enc.image_trs(modal_enc.image_embedding.weight)
-                _ht = modal_enc.norm_t(torch.nn.functional.relu(modal_enc.text_trs(modal_enc.text_embedding.weight))) if hasattr(modal_enc, 'norm_t') else modal_enc.text_trs(modal_enc.text_embedding.weight)
-                _sv = _hv.norm(dim=-1, keepdim=True)
-                _st = _ht.norm(dim=-1, keepdim=True)
-                _ww = torch.softmax(torch.cat([_sv, _st], dim=-1), dim=-1)
-                _w_img = _ww[:,0].mean().item()
-                _w_txt = _ww[:,1].mean().item()
-                _w_std = _ww[:,0].std().item()
-            print(f"[EPOCH_MODAL] epoch={iter_idx} w_img={_w_img:.3f} w_txt={_w_txt:.3f} std={_w_std:.3f} {'⚠ COLLAPSE' if _w_img > 0.95 or _w_txt > 0.95 else 'OK'}", flush=True)
+        valid_rmse,_,_ = net.evaluate_rating(valid_dataloader, etype='valid')
+        logging_str = f"Epoch={iter_idx:>3d}, " \
+                      f"Train_Loss={train_rmse:.4f}, MI={train_mi:.2f}, Valid_RMSE={valid_rmse:.4f}, "
 
-            # DIAG : contribution modale late fusion — norme de (1-alpha)*h_modal vs alpha*collab
-            _modal_contrib  = ((1 - _alpha) * _h[:_n]).norm(dim=-1).mean().item()
-            _collab_contrib = (_alpha * _e).norm(dim=-1).mean().item()
-            print(f"[CONTRIB] collab={_collab_contrib:.3f} modal={_modal_contrib:.3f} ratio_modal={_modal_contrib/(_modal_contrib+_collab_contrib)*100:.1f}%", flush=True)
+        # tb_logger.add_scalar('Train_RMSE', train_rmse, iter_idx)
+        # tb_logger.add_scalar('Valid_RMSE', valid_rmse, iter_idx)
 
-            # ── DIAG COLD vs WARM : alpha gate appris ────────────────────────────
-            _c_idx = _diag_cold_idx.to(_e.device)
-            _w_idx = _diag_warm_idx.to(_e.device)
-            _gate_in_cold = torch.cat([_e[_c_idx], _deg_norm[_c_idx]], dim=-1)
-            _gate_in_warm  = torch.cat([_e[_w_idx],  _deg_norm[_w_idx]],  dim=-1)
-            _alpha_cold = torch.sigmoid(net.rating_encoder.gate_mlp(_gate_in_cold)).detach()
-            _alpha_warm  = torch.sigmoid(net.rating_encoder.gate_mlp(_gate_in_warm)).detach()
-            print(f"[GATE_COLDWARM] epoch={iter_idx}", flush=True)
-            print(f"  alpha cold={_alpha_cold.mean():.3f}±{_alpha_cold.std():.3f}  warm={_alpha_warm.mean():.3f}±{_alpha_warm.std():.3f}", flush=True)
-            print(f"  (cold alpha < warm alpha → gate apprend bien le proxy degré)", flush=True)
-            _sim_cold = torch.nn.functional.cosine_similarity(_e[_c_idx], _h[_c_idx], dim=-1).mean().item()
-            _sim_warm  = torch.nn.functional.cosine_similarity(_e[_w_idx],  _h[_w_idx],  dim=-1).mean().item()
-            print(f"  cosine_sim(collab, modal): cold={_sim_cold:.4f}  warm={_sim_warm:.4f}", flush=True)
-            # ────────────────────────────────────────────────────────────────────
-
-            # --- Comparaison norme user vs item (représentations finales pour la prédiction) ---
-            _urf_norm = urf.detach().norm(dim=-1).mean().item()
-            _irf_norm = irf.detach().norm(dim=-1).mean().item()
-            _ratio    = _urf_norm / (_irf_norm + 1e-9)
-            repr_norm_history.append((iter_idx, _urf_norm, _irf_norm, _ratio))
-            print(f"[REPR_NORM] epoch={iter_idx:>3d}  user={_urf_norm:.4f}  item={_irf_norm:.4f}  ratio_u/i={_ratio:.4f}", flush=True)
-
-            # --- Monitoring TopicGraphEncoder : vérifie si les poids changent ---
-            if params.lambda_mi > 0:
-                with torch.no_grad():
-                    _topic_w_norm = sum(p.norm().item() for p in net.topic_encoder.parameters())
-                    _topic_g_norm = sum(
-                        p.grad.norm().item() for p in net.topic_encoder.parameters()
-                        if p.grad is not None
-                    )
-                    print(
-                        f"[TOPIC_ENCODER] epoch={iter_idx:>3d}"
-                        f"  param_norm={_topic_w_norm:.4f}"
-                        f"  grad_norm={_topic_g_norm:.4f}"
-                        f"  ed_mi={mi_score:.4f}"
-                        f"  eff_lambda={_eff_lambda_mi}"
-                        f"  (warmup={params.lambda_mi_warmup})",
-                        flush=True
-                    )
-
-        valid_ndcg  = net.evaluate_ranking_ndcg(valid_dataloader, dataset, K=10, etype='valid')
-        logging_str = (f"Epoch={iter_idx:>3d}, "
-                       f"Train_BPR={r_loss.item():.4f}, MI={mi_score:.2f}, Valid_nDCG@10={valid_ndcg:.4f}, ")
-
-        if valid_ndcg > best_valid_ndcg:
-            best_valid_ndcg = valid_ndcg
+        if valid_rmse < best_valid_rmse:
+            best_valid_rmse = valid_rmse
             no_better_valid = 0
-            best_iter       = iter_idx
-            test_ndcg       = net.evaluate_ranking_ndcg(test_dataloader, dataset, K=10, etype='test')
-            best_test_ndcg  = test_ndcg
-            logging_str    += f'Test_nDCG@10={test_ndcg:.4f}'
-            checkpoint      = net.state_dict()
-            checkpoint['modal_enc'] = modal_enc.state_dict()
-            torch.save(checkpoint, params.model_save_path)
+            best_iter = iter_idx
+            # test_rmse = evaluate(params.device, net, test_dataloader, 'test')
+            test_rmse, test_mae, test_mse = net.evaluate_rating(test_dataloader, etype='test')
+            best_test_rmse = test_rmse
+            best_test_mae = test_mae
+            best_test_mse = test_mse
+
+            logging_str += f'Test RMSE={test_rmse:.4f}'
+            # tb_logger.add_scalar('Test_RMSE', valid_rmse, iter_idx)
+            torch.save(net.state_dict(), params.model_save_path)
         else:
             no_better_valid += 1
             if no_better_valid > params.train_early_stopping_patience and learning_rate <= params.train_min_lr:
@@ -1339,6 +1040,7 @@ def train(params):
                     no_better_valid = 0
 
         logger.info(logging_str)
+        # print('Valid -', format_dict_to_str(net.evaluate_sentence_ranking(valid_dataloader, graph, topic_sampler, etype='valid')))
         logger.info('Test - ' + format_dict_to_str(net.evaluate_sentence_ranking(test_dataloader, graph, topic_sampler, etype='test')))
         
     hparam_dict = args_to_dict(params)
@@ -1348,24 +1050,11 @@ def train(params):
     #                       metric_dict={'Valid_RMSE': best_valid_rmse, 'Test_RMSE': best_test_rmse}, \
     #                       run_name='metric')
 
-    logger.info(f'Best Iter Idx={best_iter}, Best Valid nDCG@10={best_valid_ndcg:.4f}, Best Test nDCG@10={best_test_ndcg:.4f}')
+    logger.info(f'Best Iter Idx={best_iter}, Best Valid RMSE={best_valid_rmse:.4f}, Best Test RMSE={best_test_rmse:.4f}, Best Test MAE={best_test_mae:.4f}, Best Test MSE={best_test_mse:.4f}')
     logger.info(params.model_save_path)
-
-    # --- Résumé évolution norme user vs item ---
-    logger.info("=== Évolution norme représentations finales user vs item par epoch ===")
-    logger.info(f"{'Epoch':>6} | {'user_norm':>9} | {'item_norm':>9} | {'ratio_u/i':>9}")
-    for ep, un, it, rt in repr_norm_history:
-        flag = "  <-- DESEQUILIBRE" if rt > 2.0 or rt < 0.5 else ""
-        logger.info(f"{ep:>6d} | {un:>9.4f} | {it:>9.4f} | {rt:>9.4f}{flag}")
 
 
 def test(params):
-    """Déplacé dans evaluate_model_run.py — conservé ici pour compatibilité ascendante."""
-    from evaluate_model_run import test as _eval_test
-    _eval_test(params)
-
-
-def _test_legacy(params):
     from nltk.translate.bleu_score import sentence_bleu
     from rouge import Rouge
     # logger = get_logger(params.model_short_name, None)
@@ -1385,83 +1074,13 @@ def _test_legacy(params):
     topic_sampler = dataset.get_topic_sentence_sampler()
 
     net = Net(dataset.review_embedding, dataset.sentence_embedding, params)
-    _ckpt = torch.load(params.model_save_path, weights_only=False)
-    _modal_sd = _ckpt.pop('modal_enc', None)
-    net.load_state_dict(_ckpt, strict=False)
+    net.load_state_dict(torch.load(params.model_save_path), strict=False)
     net = net.to(params.device)
-    # Initialise h_modal pour test() — charger les poids entraînés
-    from modal_encoder import ModalEncoder, load_modal_features
-    v_feat, t_feat = load_modal_features('/home/infres/belguith/PFE/bm3_data/musical')
-    _modal_enc_test = ModalEncoder(v_feat, t_feat, embed_dim=128).to(params.device)
-    if _modal_sd is not None:
-        missing, unexpected = _modal_enc_test.load_state_dict(_modal_sd, strict=False)
-        matched = len(_modal_sd) - len(unexpected)
-        print(f"[LOAD] modal_enc: {matched}/{len(_modal_sd)} clés chargées depuis checkpoint", flush=True)
-        if missing:
-            print(f"[WARN] Clés manquantes (resteront aléatoires): {missing}", flush=True)
-    else:
-        print("[WARN] modal_enc ABSENT du checkpoint — features aléatoires en test !", flush=True)
-    with torch.no_grad():
-        _h_modal_test, _, _ = _modal_enc_test()
-    net.rating_encoder.h_modal = _h_modal_test
 
-    # Charge les groupes cold/medium/warm pour évaluation
-    import pandas as pd
-    _df_deg = pd.read_csv('/home/infres/belguith/PFE/processed/Musical_interactions_reviews.csv')
-    _deg = _df_deg['iid'].value_counts()
-    _n_items = net.rating_encoder.item_embedding.shape[0]
-    _deg_tensor = torch.zeros(_n_items, dtype=torch.float32)
-    for _iid, _cnt in _deg.items():
-        if int(_iid) < _n_items:
-            _deg_tensor[int(_iid)] = float(_cnt)
-    net.rating_encoder.item_degree_tensor = _deg_tensor.to(params.device)
-    net.item_degree_groups = (
-        set(_deg[(_deg>=5)&(_deg<=10)].index),
-        set(_deg[(_deg>=11)&(_deg<=20)].index),
-        set(_deg[_deg>20].index)
-    )
-    net._cs_buffer = []
-    net._ranking_buffer = []
-    net._alpha_buffer = []
     test_rmse,test_mae,test_mse = net.evaluate_rating(test_dataloader, etype='test')
+
     print(params.dataset_name)
     print(f'Test RMSE={test_rmse:.4f},Test MAE={test_mae:.4f},Test MSE={test_mse:.4f}')
-
-    # Ranking evaluation depuis _ranking_buffer (uid, iid, pred_score, true_rating)
-    if net._ranking_buffer:
-        import math
-        from collections import defaultdict
-        user_items = defaultdict(list)
-        for uid, iid, pred, true in net._ranking_buffer:
-            user_items[uid].append((iid, pred, true))
-
-        Ks = [3, 5, 10]
-        ndcg_buf   = {k: [] for k in Ks}
-        recall_buf = {k: [] for k in Ks}
-        hr_buf     = {k: [] for k in Ks}
-        prec_buf   = {k: [] for k in Ks}
-
-        for uid, items in user_items.items():
-            positives = set(iid for iid, _, r in items if r >= 1)
-            if not positives:
-                continue
-            ranked_ids = [x[0] for x in sorted(items, key=lambda x: x[1], reverse=True)]
-            n_pos = len(positives)
-            for K in Ks:
-                top_k = ranked_ids[:K]
-                hits = sum(1 for iid in top_k if iid in positives)
-                dcg  = sum(1.0/math.log2(i+2) for i, iid in enumerate(top_k) if iid in positives)
-                idcg = sum(1.0/math.log2(i+2) for i in range(min(n_pos, K)))
-                ndcg_buf[K].append(dcg/idcg if idcg > 0 else 0.0)
-                recall_buf[K].append(hits / n_pos)
-                hr_buf[K].append(1.0 if hits > 0 else 0.0)
-                prec_buf[K].append(hits / K)
-
-        print(f"\n[RANKING] threshold=1 (rating>=1 → positif), {len(user_items)} users évalués")
-        print(f"  {'K':>4}  {'nDCG':>7}  {'Recall':>7}  {'HR':>7}  {'Prec':>7}")
-        for K in Ks:
-            if ndcg_buf[K]:
-                print(f"  {K:>4}  {np.mean(ndcg_buf[K]):>7.4f}  {np.mean(recall_buf[K]):>7.4f}  {np.mean(hr_buf[K]):>7.4f}  {np.mean(prec_buf[K]):>7.4f}")
     print('Pre     Rec     F1      nDCG')
     for k in [10, 50]:
         scores = net.evaluate_sentence_ranking(test_dataloader, graph, topic_sampler, etype='test', topk=k)
@@ -1499,9 +1118,6 @@ def calc_rouge_metric(predict_list, true_list):
 
 if __name__ == '__main__':
     config_args = config()
-    if config_args.test_only:
-        test(config_args)
-    else:
-        train(config_args)
-        test(config_args)
+    train(config_args)
+    test(config_args)
 

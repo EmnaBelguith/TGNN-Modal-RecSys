@@ -31,7 +31,7 @@ class GraphData(object):
         dir_path = f'/home/infres/belguith/PFE/HADSF_test/checkpoint/{dataset_name}/'
 
         self.possible_rating_values = np.arange(1, 6)
-        graph_path = f'{dir_path}/hyper_graph.bin'
+        graph_path = f'{dir_path}/hyper_graph_binary.bin'
 
         if os.path.exists(graph_path):
             self.graph = load_graphs(graph_path, [0])[0][0]
@@ -209,19 +209,10 @@ class GraphData(object):
         # test_sid_list = torch.LongTensor(test_sid_list)
 
         data_dict = dict()
-        rating_to_rid = dict()
-        # num_nodes_dict = {'user': self.user_size, 'item': self.item_size}
+        # Graphe binaire : toutes les interactions train fusionnées en 2 edge types
         rating_row, rating_col = self.train_uir[:2]
-        for rating in self.possible_rating_values:
-            ridx = np.where(self.train_uir[2] == rating)
-            rrow = rating_row[ridx]
-            rcol = rating_col[ridx]
-            rating = str(rating)
-            data_dict.update({
-                ('user', str(rating), 'item'): (rrow, rcol),
-                ('item', 'rev-%s' % str(rating), 'user'): (rcol, rrow)
-            })
-            rating_to_rid[rating] = train_rid_list[ridx]
+        data_dict[('user', 'interacts', 'item')] = (rating_row, rating_col)
+        data_dict[('item', 'rev', 'user')] = (rating_col, rating_row)
 
         data_dict[('user', 'train', 'item')] = self.train_uir[:2]
         data_dict[('user', 'valid', 'item')] = self.valid_uir[:2]
@@ -318,9 +309,8 @@ class GraphData(object):
         graph['test'].edata['review_id'] = test_rid_list
         graph['test'].edata['sentence_id'] = test_sid_list
 
-        for rating in self.possible_rating_values:
-            graph[str(rating)].edata['review_id'] = rating_to_rid[str(rating)]
-            graph['rev-%s' % str(rating)].edata['review_id'] = rating_to_rid[str(rating)]
+        graph['interacts'].edata['review_id'] = train_rid_list
+        graph['rev'].edata['review_id'] = train_rid_list
 
         def _calc_norm(x):
             x = x.numpy().astype('float32')
@@ -328,20 +318,10 @@ class GraphData(object):
             x = torch.FloatTensor(1. / np.sqrt(x))
             return x.unsqueeze(1)
 
-        user_ci = []
-        user_cj = []
-        item_ci = []
-        item_cj = []
-        for r in self.possible_rating_values:
-            r = str(r)
-            user_ci.append(graph['rev-%s' % r].in_degrees())
-            item_ci.append(graph[r].in_degrees())
-            user_cj.append(graph[r].out_degrees())
-            item_cj.append(graph['rev-%s' % r].out_degrees())
-        user_ci = _calc_norm(sum(user_ci))
-        item_ci = _calc_norm(sum(item_ci))
-        user_cj = _calc_norm(sum(user_cj))
-        item_cj = _calc_norm(sum(item_cj))
+        user_ci = _calc_norm(graph['rev'].in_degrees())
+        item_ci = _calc_norm(graph['interacts'].in_degrees())
+        user_cj = _calc_norm(graph['interacts'].out_degrees())
+        item_cj = _calc_norm(graph['rev'].out_degrees())
         graph.nodes['user'].data.update({'ci': user_ci, 'cj': user_cj})
         graph.nodes['item'].data.update({'ci': item_ci, 'cj': item_cj})
 

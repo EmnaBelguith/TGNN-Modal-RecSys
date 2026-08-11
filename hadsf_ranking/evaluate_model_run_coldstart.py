@@ -12,7 +12,7 @@ import pandas as pd
 from collections import defaultdict
 
 from model_run import config, Net as _DefaultNet, get_logger
-from rhg_data import GraphData
+from rhg_data_coldstart import GraphData
 from modal_encoder import ModalEncoder, load_modal_features
 
 
@@ -59,11 +59,10 @@ def evaluate_item_ranking(net, test_dataloader, dataset, ks=(5, 10, 20),
             item_deg[i] += 1
 
     def _group(iids):
-        """Groupe d'un user selon le degré de ses items positifs (exclusif)."""
+        """Coldstart : cold = jamais vu en train (deg=0), popular = vu en train (deg>0)."""
         degs = [item_deg.get(i, 0) for i in iids]
-        if all(5  <= d <= 10 for d in degs): return 'cold'
-        if all(11 <= d <= 20 for d in degs): return 'medium'
-        if all(d  > 20       for d in degs): return 'warm'
+        if all(d == 0 for d in degs): return 'cold'
+        if all(d  > 0 for d in degs): return 'popular'
         return None  # mixte → exclu du per-group
 
     # ── 2. Collecter embeddings user/item depuis le dataloader ────────────────
@@ -87,7 +86,12 @@ def evaluate_item_ranking(net, test_dataloader, dataset, ks=(5, 10, 20),
                     user_emb[global_u] = urf[local_u].cpu()
             for local_i, global_i in enumerate(g_seed_iids):
                 if global_i not in item_emb:
-                    item_emb[global_i] = irf[local_i].cpu()
+                    if item_deg.get(global_i, 0) == 0:
+                        # Cold item : le GCN n'a aucun voisin train à agréger → output nul/bruit.
+                        # On utilise h_modal directement (seule représentation utile pour ces items).
+                        item_emb[global_i] = net.rating_encoder.h_modal[global_i].detach().cpu()
+                    else:
+                        item_emb[global_i] = irf[local_i].cpu()
 
             p_scores     = net.predict_score(input_nodes_dev, blocks_dev, edge_subgraph_test)
             true_ratings = edge_subgraph_test.edata['rating']
@@ -122,7 +126,7 @@ def evaluate_item_ranking(net, test_dataloader, dataset, ks=(5, 10, 20),
     results  = {k: {'ndcg': [], 'recall': [], 'hr': [], 'precision': []} for k in ks}
     grp_results = {g: {k: {'ndcg': [], 'recall': [], 'hr': [], 'precision': []}
                         for k in ks}
-                   for g in ('cold', 'medium', 'warm', 'non_cold')}
+                   for g in ('cold', 'popular')}
 
     for uid, items in user_records.items():
         if uid not in user_emb:
@@ -167,22 +171,17 @@ def evaluate_item_ranking(net, test_dataloader, dataset, ks=(5, 10, 20),
                 grp_results[group][k]['recall'].append(rec_v)
                 grp_results[group][k]['hr'].append(hr_v)
                 grp_results[group][k]['precision'].append(prec_v)
-                if group in ('medium', 'warm'):
-                    grp_results['non_cold'][k]['ndcg'].append(ndcg_v)
-                    grp_results['non_cold'][k]['recall'].append(rec_v)
-                    grp_results['non_cold'][k]['hr'].append(hr_v)
-                    grp_results['non_cold'][k]['precision'].append(prec_v)
 
     n_eval = len(results[ks[0]]['ndcg'])
     print(f"  [ranking] {n_eval} users évalués, pool=pos + {n_neg} neg, scoring uniforme via score_pairs")
-    for g in ('cold', 'medium', 'warm', 'non_cold'):
+    for g in ('cold', 'popular'):
         n_g = len(grp_results[g][ks[0]]['ndcg'])
         print(f"  [{g:8s}] {n_g} users")
 
     global_out = {k: {m: float(np.mean(v)) for m, v in metrics.items()}
                   for k, metrics in results.items()}
     grp_out = {}
-    for g in ('cold', 'medium', 'warm', 'non_cold'):
+    for g in ('cold', 'popular'):
         grp_out[g] = {k: {m: float(np.mean(v)) if v else 0.0
                           for m, v in metrics.items()}
                       for k, metrics in grp_results[g].items()}
@@ -220,7 +219,9 @@ def test(params, net_class=None):
     net = net.to(params.device)
 
     # ── Chargement modal_encoder entraîné ────────────────────────────────────
-    _dataset_to_modal = {'Musical_HADSF': 'musical', 'Baby_HADSF': 'baby', 'CDs_HADSF': 'cds'}
+    _dataset_to_modal = {'Musical_HADSF': 'musical', 'Musical_HADSF_coldstart': 'musical',
+                         'Baby_HADSF': 'baby', 'Baby_HADSF_coldstart': 'baby',
+                         'CDs_HADSF': 'cds', 'CDs_HADSF_coldstart': 'cds'}
     _modal_dir = _dataset_to_modal.get(getattr(params, 'dataset_name', 'Musical_HADSF'), 'musical')
     v_feat, t_feat = load_modal_features(f'/home/infres/belguith/PFE/bm3_data/{_modal_dir}')
     modal_enc_test = ModalEncoder(v_feat, t_feat, embed_dim=128).to(params.device)
@@ -237,15 +238,19 @@ def test(params, net_class=None):
     net.rating_encoder.h_modal = h_modal_test
 
     # ── Degrés + groupes cold/medium/warm ────────────────────────────────────
-    _n = net.rating_encoder.item_embedding.shape[0]
-    _tr_u, _tr_i = dataset.graph['interacts'].edges()
-    _deg_tensor  = torch.zeros(_n, dtype=torch.float32)
-    _deg_tensor.scatter_add_(0, _tr_i.long(), torch.ones(_tr_i.shape[0]))
+    _cat    = params.dataset_name.replace('_HADSF_coldstart', '').replace('_HADSF', '')
+    _df_deg = pd.read_csv(f'/home/infres/belguith/PFE/processed/{_cat}_interactions_reviews_coldstart.csv')
+    _deg    = _df_deg['iid'].value_counts()
+    _n      = net.rating_encoder.item_embedding.shape[0]
+    _deg_tensor = torch.zeros(_n, dtype=torch.float32)
+    for _iid, _cnt in _deg.items():
+        if int(_iid) < _n:
+            _deg_tensor[int(_iid)] = float(_cnt)
     net.rating_encoder.item_degree_tensor = _deg_tensor.to(params.device)
     net.item_degree_groups = (
-        set(_deg[(_deg >= 5)  & (_deg <= 10)].index),   # cold
-        set(_deg[(_deg >= 11) & (_deg <= 20)].index),   # medium
-        set(_deg[_deg > 20].index)                       # warm
+        set(_deg[_deg == 0].index),   # cold    (jamais vu en train)
+        set(),                         # medium  (non utilisé en coldstart)
+        set(_deg[_deg  > 0].index)    # popular (vu en train)
     )
     net._cs_buffer = []
 
@@ -261,8 +266,8 @@ def test(params, net_class=None):
     item_rank_scores, grp_rank_scores = evaluate_item_ranking(net, test_dataloader, dataset, ks=(5, 10, 20))
     for k, m in sorted(item_rank_scores.items()):
         print(f'  @{k:<3}  {m["ndcg"]:>8.4f}  {m["recall"]:>9.4f}  {m["hr"]:>7.4f}  {m["precision"]:>8.4f}')
-    for g in ('cold', 'non_cold', 'medium', 'warm'):
-        label = '[non-cold]' if g == 'non_cold' else f'[{g}]'
+    for g in ('cold', 'popular'):
+        label = f'[{g}]'
         print(f'\n  {label}')
         for k, m in sorted(grp_rank_scores[g].items()):
             print(f'  @{k:<3}  {m["ndcg"]:>8.4f}  {m["recall"]:>9.4f}  {m["hr"]:>7.4f}  {m["precision"]:>8.4f}')
