@@ -1,10 +1,10 @@
 #!/bin/bash
-#SBATCH --job-name=tgnn_degree_gate
+#SBATCH --job-name=tgnn_simple_gate
 #SBATCH --partition=V100
 #SBATCH --gres=gpu:1
 #SBATCH --time=04:00:00
-#SBATCH --output=/home/infres/belguith/PFE/logs/tgnn_degree_gate_%j.out
-#SBATCH --error=/home/infres/belguith/PFE/logs/tgnn_degree_gate_%j.err
+#SBATCH --output=/home/infres/belguith/PFE/logs/tgnn_simple_gate_%j.out
+#SBATCH --error=/home/infres/belguith/PFE/logs/tgnn_simple_gate_%j.err
 
 module load cuda/12.1
 
@@ -13,8 +13,8 @@ conda deactivate
 conda deactivate
 conda activate new_env
 export PYTHONNOUSERSITE=1
-export PYTHONPATH=""
+export PYTHONPATH="/home/infres/belguith/PFE/HADSF_test/model/tgnn"
 export PATH="/home/infres/belguith/.conda/envs/new_env/bin:$PATH"
 
 cd /home/infres/belguith/PFE/HADSF_test/model/tgnn
-python model_run.py
+python /home/infres/belguith/PFE/TGNN-Modal-RecSys/model/model_run.py
